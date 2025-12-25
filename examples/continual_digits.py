@@ -10,7 +10,12 @@ from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 
 from nested_learning.hope import HOPEModel
-from nested_learning.torch_optim import ContextSteeredOptimizer, SteeredOptimizerConfig
+from nested_learning.torch_optim import (
+    ContextSteeredOptimizer,
+    SteeredOptimizerConfig,
+    load_optimizer_state,
+    save_optimizer_state,
+)
 
 
 def prepare_tasks():
@@ -92,6 +97,8 @@ def main():
     parser.add_argument("--self-mod-query-static", action="store_true")
     parser.add_argument("--steered-optim", action="store_true")
     parser.add_argument("--precondition", type=str, default="outer", choices=["none", "adagrad", "adam", "outer"])
+    parser.add_argument("--optimizer-state-path", type=str, default="")
+    parser.add_argument("--reset-optimizer-between-tasks", action="store_true")
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -141,6 +148,18 @@ def main():
         memory_chunk_size=args.memory_chunk_size,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
+
+    if args.optimizer_state_path:
+        save_optimizer_state(optimizer, args.optimizer_state_path)
+    if args.reset_optimizer_between_tasks:
+        if args.optimizer_state_path:
+            load_optimizer_state(optimizer, args.optimizer_state_path)
+        else:
+            if args.steered_optim:
+                config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
+                optimizer = ContextSteeredOptimizer(model.parameters(), base_optimizer, config=config, lr=1e-3)
+            else:
+                optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
     train_task(
         model,

@@ -1,7 +1,23 @@
 """Nested Learning package."""
 
-from .nn import Linear, LayerNorm, MLP, NestedContextFlow, SelfReferentialTitan, SelfModifyingStack
-from .torch_optim import ContextSteeredOptimizer, DGD, SteeredOptimizerConfig
+from .nn import (
+    AssociativeMemory,
+    Linear,
+    LayerNorm,
+    MLP,
+    NestedContextFlow,
+    SelfReferentialTitan,
+    SelfModifyingStack,
+)
+from .torch_optim import (
+    ContextSteeredOptimizer,
+    DGD,
+    GGD,
+    GM,
+    SteeredOptimizerConfig,
+    load_optimizer_state,
+    save_optimizer_state,
+)
 from .memory import (
     ContinuumMemorySystem,
     NestedContinuumMemorySystem,
@@ -17,9 +33,14 @@ __all__ = [
     "SelfReferentialTitan",
     "SelfModifyingStack",
     "NestedContextFlow",
+    "AssociativeMemory",
     "DGD",
+    "GGD",
+    "GM",
     "ContextSteeredOptimizer",
     "SteeredOptimizerConfig",
+    "save_optimizer_state",
+    "load_optimizer_state",
     "ContinuumMemorySystem",
     "NestedContinuumMemorySystem",
     "SequentialContinuumMemorySystem",

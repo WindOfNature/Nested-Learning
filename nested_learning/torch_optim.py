@@ -48,6 +48,88 @@ class DGD(torch.optim.Optimizer):
         return loss
 
 
+class GGD(torch.optim.Optimizer):
+    """Generalized Gradient Descent (GGD) with self-referential value generation."""
+
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        retention: float = 0.0,
+        eps: float = 1e-8,
+    ):
+        defaults = dict(lr=lr, retention=retention, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            retention = group["retention"]
+            eps = group["eps"]
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                state = self.state[param]
+                if "value" not in state:
+                    state["value"] = torch.zeros_like(param)
+                value = state["value"]
+                grad = param.grad
+                value.copy_(-grad)
+                update = value
+                if retention:
+                    update = update + retention * param
+                update = update / (update.norm() + eps)
+                param.add_(update, alpha=-lr)
+        return loss
+
+
+class GM(torch.optim.Optimizer):
+    """Generalized Momentum (GM) with self-referential momentum states."""
+
+    def __init__(
+        self,
+        params: Iterable[torch.nn.Parameter],
+        lr: float = 1e-3,
+        beta: float = 0.9,
+        retention: float = 0.0,
+        eps: float = 1e-8,
+    ):
+        defaults = dict(lr=lr, beta=beta, retention=retention, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta = group["beta"]
+            retention = group["retention"]
+            eps = group["eps"]
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                state = self.state[param]
+                if "momentum" not in state:
+                    state["momentum"] = torch.zeros_like(param)
+                momentum = state["momentum"]
+                grad = param.grad
+                momentum.mul_(beta).add_(grad, alpha=1 - beta)
+                update = -momentum
+                if retention:
+                    update = update + retention * param
+                update = update / (update.norm() + eps)
+                param.add_(update, alpha=-lr)
+        return loss
+
+
 @dataclass
 class SteeredOptimizerConfig:
     """Configuration for steering base torch optimizers with associative-memory state."""
@@ -158,3 +240,31 @@ class ContextSteeredOptimizer:
         for param, grad in original_grads.items():
             param.grad = grad
         return loss
+
+    def state_dict(self):
+        return {
+            "base_optimizer": self.base_optimizer.state_dict(),
+            "steering_state": {id(p): s for p, s in self.state.items()},
+            "config": self.config,
+        }
+
+    def load_state_dict(self, state_dict):
+        self.base_optimizer.load_state_dict(state_dict["base_optimizer"])
+        id_map = {id(p): p for p in self.params}
+        self.state = {}
+        for param_id, state in state_dict.get("steering_state", {}).items():
+            param = id_map.get(param_id)
+            if param is not None:
+                self.state[param] = {k: v.to(param.device) for k, v in state.items()}
+        config = state_dict.get("config")
+        if config is not None:
+            self.config = config
+
+
+def save_optimizer_state(optimizer: torch.optim.Optimizer, path: str):
+    torch.save(optimizer.state_dict(), path)
+
+
+def load_optimizer_state(optimizer: torch.optim.Optimizer, path: str):
+    state = torch.load(path, map_location="cpu")
+    optimizer.load_state_dict(state)

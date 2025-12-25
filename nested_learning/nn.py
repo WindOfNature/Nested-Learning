@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -92,6 +92,64 @@ class MemoryMLP(nn.Module):
 
 
 @dataclass
+class AssociativeMemoryState:
+    memory: torch.Tensor
+    time: int
+
+
+class AssociativeMemory(nn.Module):
+    """Associative memory with parametric and non-parametric modes."""
+
+    def __init__(
+        self,
+        features: int,
+        value_dim: Optional[int] = None,
+        mode: Literal["parametric", "nonparametric"] = "parametric",
+        rule: Literal["hebbian", "delta", "oja"] = "delta",
+    ):
+        super().__init__()
+        self.features = features
+        self.value_dim = value_dim or features
+        self.mode = mode
+        self.rule = rule
+        self.register_buffer("memory", torch.zeros(self.value_dim, self.features))
+        self.state = AssociativeMemoryState(memory=self.memory, time=0)
+        if mode == "parametric":
+            self.memory_net = MemoryMLP(features, hidden_features=features * 2)
+        else:
+            self.memory_net = None
+
+    def forward(self, keys: torch.Tensor, values: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        if self.mode == "nonparametric":
+            scores = queries @ keys.t()
+            weights = torch.softmax(scores, dim=-1)
+            return weights @ values
+        if self.memory_net is None:
+            raise RuntimeError("Parametric memory net not initialized")
+        return self.memory_net(queries)
+
+    def update_memory(self, keys: torch.Tensor, values: torch.Tensor, eta: float, alpha: float):
+        if self.mode == "parametric":
+            if self.memory_net is None:
+                return
+            self.memory_net.dgd_update(keys, values, lr=eta, weight_decay=alpha)
+            return
+        with torch.no_grad():
+            for k, v in zip(keys, values):
+                k = k.unsqueeze(-1)
+                v = v.unsqueeze(-1)
+                if self.rule == "hebbian":
+                    self.memory.mul_(alpha).add_(v @ k.t(), alpha=eta)
+                elif self.rule == "oja":
+                    self.memory.mul_(alpha).add_(v @ k.t(), alpha=eta)
+                    self.memory.sub_(self.memory.t() @ v @ k.t(), alpha=eta)
+                else:  # delta rule
+                    pred = self.memory @ k
+                    self.memory.mul_(alpha).add_((v - pred) @ k.t(), alpha=eta)
+            self.state = AssociativeMemoryState(memory=self.memory, time=self.state.time + 1)
+
+
+@dataclass
 class MemorySignals:
     k: torch.Tensor
     v: torch.Tensor
@@ -131,12 +189,10 @@ class SelfReferentialTitan(nn.Module):
 
     def _update_modules(
         self,
-        x: torch.Tensor,
+        signals: MemorySignals,
         update_memory: bool = True,
         update_projections: bool = True,
     ):
-        x_detached = x.detach()
-        signals = self.generate_signals(x_detached)
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
 
@@ -159,15 +215,23 @@ class SelfReferentialTitan(nn.Module):
             with torch.no_grad():
                 self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
 
+    def _compute_signals(self, x: torch.Tensor) -> MemorySignals:
+        x_detached = x.detach()
+        return self.generate_signals(x_detached)
+
     def update_chunk(self, x: torch.Tensor, chunk_size: int | None = None, memory_chunk_size: int | None = None):
         chunk_size = chunk_size or x.shape[0]
         memory_chunk_size = memory_chunk_size or chunk_size
         if chunk_size <= 0 or memory_chunk_size <= 0:
             raise ValueError("chunk_size and memory_chunk_size must be positive")
         for start in range(0, x.shape[0], chunk_size):
-            self._update_modules(x[start : start + chunk_size], update_memory=False, update_projections=True)
+            chunk = x[start : start + chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(signals, update_memory=False, update_projections=True)
         for start in range(0, x.shape[0], memory_chunk_size):
-            self._update_modules(x[start : start + memory_chunk_size], update_memory=True, update_projections=False)
+            chunk = x[start : start + memory_chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(signals, update_memory=True, update_projections=False)
 
 
 class SelfModifyingStack(nn.Module):
