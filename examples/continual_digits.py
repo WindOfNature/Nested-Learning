@@ -30,9 +30,10 @@ def train_task(
     epochs: int,
     task_id: int,
     batch_size: int,
+    rng: np.random.Generator,
 ):
     for epoch in range(epochs):
-        indices = np.random.permutation(len(x))
+        indices = rng.permutation(len(x))
         for step in range(0, len(indices), batch_size):
             batch_idx = indices[step : step + batch_size]
             input_tensor = Tensor(x[batch_idx], requires_grad=True)
@@ -50,7 +51,7 @@ def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int) ->
     for step in range(0, len(x), batch_size):
         batch_x = x[step : step + batch_size]
         batch_y = y[step : step + batch_size]
-        logits = model.forward(Tensor(batch_x, requires_grad=False), time=step)
+        logits = model.forward(Tensor(batch_x, requires_grad=False), time=step, update_memory=False)
         preds = np.argmax(logits.data, axis=-1)
         correct += int((preds == batch_y).sum())
     return correct / len(x)
@@ -58,10 +59,14 @@ def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int) ->
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=500)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    rng = np.random.default_rng(args.seed)
+    Tensor.set_seed(args.seed)
 
     (xa, ya), (xb, yb) = prepare_tasks()
     xa_train, xa_test, ya_train, ya_test = train_test_split(xa, ya, test_size=0.2, random_state=42)
@@ -80,10 +85,28 @@ def main():
     )
     optimizer = AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
-    train_task(model, optimizer, xa_train, ya_train, epochs=args.epochs, task_id=0, batch_size=args.batch_size)
+    train_task(
+        model,
+        optimizer,
+        xa_train,
+        ya_train,
+        epochs=args.epochs,
+        task_id=0,
+        batch_size=args.batch_size,
+        rng=rng,
+    )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size)
 
-    train_task(model, optimizer, xb_train, yb_train, epochs=args.epochs, task_id=1, batch_size=args.batch_size)
+    train_task(
+        model,
+        optimizer,
+        xb_train,
+        yb_train,
+        epochs=args.epochs,
+        task_id=1,
+        batch_size=args.batch_size,
+        rng=rng,
+    )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size)
 

@@ -15,12 +15,18 @@ class _Context:
 
 
 class Tensor:
+    _rng = np.random.default_rng()
+
     def __init__(self, data, requires_grad: bool = False, name: Optional[str] = None):
         self.data = np.asarray(data, dtype=np.float32)
         self.requires_grad = requires_grad
         self.grad: Optional[np.ndarray] = None
         self._ctx: Optional[_Context] = None
         self.name = name
+
+    @staticmethod
+    def set_seed(seed: int):
+        Tensor._rng = np.random.default_rng(seed)
 
     @staticmethod
     def zeros(shape, requires_grad: bool = False, name: Optional[str] = None):
@@ -32,7 +38,7 @@ class Tensor:
 
     @staticmethod
     def randn(shape, requires_grad: bool = False, seed: Optional[int] = None, name: Optional[str] = None):
-        rng = np.random.default_rng(seed)
+        rng = Tensor._rng if seed is None else np.random.default_rng(seed)
         return Tensor(rng.standard_normal(size=shape, dtype=np.float32), requires_grad=requires_grad, name=name)
 
     def detach(self):

@@ -77,6 +77,28 @@ class AdamW(Adam):
             p.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
 
+class DGD(Optimizer):
+    """Delta Gradient Descent (DGD) with L2-regression-inspired updates."""
+
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3, beta: float = 0.9, alpha: float = 0.5, weight_decay: float = 0.0):
+        super().__init__(params, lr)
+        self.beta = beta
+        self.alpha = alpha
+        self.weight_decay = weight_decay
+        self.memory = [np.zeros_like(p.data) for p in self.params]
+
+    def step(self):
+        for idx, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            grad = p.grad
+            delta = grad + self.alpha * (grad - self.memory[idx])
+            if self.weight_decay:
+                delta = delta + self.weight_decay * p.data
+            p.data -= self.lr * delta
+            self.memory[idx] = self.beta * self.memory[idx] + (1 - self.beta) * grad
+
+
 @dataclass
 class ExpressiveState:
     memory: np.ndarray

@@ -7,6 +7,7 @@ from typing import List
 
 from .tensor import Tensor, concatenate
 from .nn import Linear, LayerNorm
+from .optim import DGD
 
 
 @dataclass
@@ -21,6 +22,14 @@ class MemoryBlock:
         self.layers = [Linear(features, features) for _ in range(depth)]
         self.norm = LayerNorm(features)
         self.state = MemoryState(time=0, value=Tensor.zeros((1, features)))
+        self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
+
+    def parameters(self) -> List[Tensor]:
+        params: List[Tensor] = []
+        for layer in self.layers:
+            params.extend(layer.parameters())
+        params.extend(self.norm.parameters())
+        return params
 
     def forward(self, x: Tensor) -> Tensor:
         out = x
@@ -28,10 +37,16 @@ class MemoryBlock:
             out = layer(out).relu()
         return self.norm(out)
 
-    def update(self, x: Tensor, time: int):
-        if time % self.frequency != 0:
+    def update(self, x: Tensor, time: int, update: bool = True):
+        if not update or time % self.frequency != 0:
             return
-        memory_value = self.forward(x).mean(axis=0, keepdims=True)
+        out = self.forward(x)
+        target = Tensor(x.data, requires_grad=False)
+        loss = ((out - target) * (out - target)).mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        memory_value = out.detach().mean(axis=0, keepdims=True)
         self.state = MemoryState(time=time, value=memory_value)
 
 
@@ -42,10 +57,10 @@ class ContinuumMemorySystem:
         self.blocks = [MemoryBlock(features, freq, depth) for freq in frequencies]
         self.features = features
 
-    def forward(self, x: Tensor, time: int) -> Tensor:
+    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
         context = x
         for block in self.blocks:
-            block.update(context, time)
+            block.update(context, time, update=update)
             context = context + block.state.value
         return context
 
@@ -61,11 +76,11 @@ class NestedContinuumMemorySystem:
         self.subsystems = [ContinuumMemorySystem(features, frequencies[: idx + 1], depth=depth) for idx in range(len(frequencies))]
         self.features = features
 
-    def forward(self, x: Tensor, time: int) -> Tensor:
+    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
         context = x
         for block, sub in zip(self.blocks, self.subsystems):
-            block.update(context, time)
-            nested_context = sub.forward(context, time)
+            block.update(context, time, update=update)
+            nested_context = sub.forward(context, time, update=update)
             context = context + block.state.value + nested_context
         return context
 
@@ -85,10 +100,10 @@ class SequentialContinuumMemorySystem:
         self.norm = LayerNorm(features)
         self.features = features
 
-    def forward(self, x: Tensor, time: int) -> Tensor:
+    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
         context = x
         for block in self.blocks:
-            block.update(context, time)
+            block.update(context, time, update=update)
             context = self.norm(context + block.state.value)
         return context
 
@@ -107,13 +122,13 @@ class HeadwiseContinuumMemorySystem:
         self.systems = [ContinuumMemorySystem(self.head_dim, frequencies, depth=depth) for _ in range(heads)]
         self.features = features
 
-    def forward(self, x: Tensor, time: int) -> Tensor:
+    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
         chunks = []
         for head in range(self.heads):
             start = head * self.head_dim
             end = start + self.head_dim
             chunk = x.slice((slice(None), slice(start, end)))
-            chunks.append(self.systems[head].forward(chunk, time))
+            chunks.append(self.systems[head].forward(chunk, time, update=update))
         return concatenate(chunks, axis=-1)
 
     def states(self) -> List[MemoryState]:

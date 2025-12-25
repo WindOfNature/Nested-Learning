@@ -8,6 +8,7 @@ import numpy as np
 
 from .tensor import Tensor
 from .kernels import cpu as cpu_kernels
+from .optim import DGD
 
 
 class Module:
@@ -102,6 +103,7 @@ class SelfModifyingLayer(Module):
         self.base = Linear(features, features)
         self.rule = MLP(features * 2, update_hidden, features)
         self.scale = Tensor.ones((features,), requires_grad=True, name="selfmod_scale")
+        self.base_optimizer = DGD(self.base.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.base(x).relu()
@@ -109,6 +111,12 @@ class SelfModifyingLayer(Module):
     def self_update(self, x: Tensor, grad: Tensor):
         context = Tensor(np.concatenate([x.data, grad.data], axis=-1), requires_grad=False)
         delta = self.rule(context).tanh()
+        target = Tensor(x.data + grad.data, requires_grad=False)
+        pred = self.base(x)
+        loss = ((pred - target) * (pred - target)).mean()
+        self.base_optimizer.zero_grad()
+        loss.backward()
+        self.base_optimizer.step()
         self.base.weight.data += self.scale.data * delta.data.mean(axis=0)
 
 

@@ -2,7 +2,7 @@
 
 from .tensor import Tensor
 from .nn import Module, Linear, LayerNorm, MLP, Sequential
-from .optim import SGD, Adam, AdamW, Muon, ExpressiveOptimizer, ShampooOptimizer
+from .optim import SGD, Adam, AdamW, DGD, Muon, ExpressiveOptimizer, ShampooOptimizer
 from .memory import (
     ContinuumMemorySystem,
     NestedContinuumMemorySystem,
@@ -21,6 +21,7 @@ __all__ = [
     "SGD",
     "Adam",
     "AdamW",
+    "DGD",
     "Muon",
     "ExpressiveOptimizer",
     "ShampooOptimizer",

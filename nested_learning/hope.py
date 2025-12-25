@@ -67,15 +67,16 @@ class HOPEModel:
             params.extend(block.norm.parameters())
         return params
 
-    def forward(self, x: Tensor, time: int) -> Tensor:
+    def forward(self, x: Tensor, time: int, update_memory: bool = True) -> Tensor:
         encoded = self.encoder(x).relu()
-        memory_context = self.cms.forward(encoded, time)
+        memory_context = self.cms.forward(encoded, time, update=update_memory)
         modulated = self.self_mod(memory_context)
         normed = self.norm(modulated)
         logits = self.decoder(normed)
-        self.state = HopeState(time=time, memory=memory_context.detach())
-        self._last_context = memory_context
-        self._last_logits = logits
+        if update_memory:
+            self.state = HopeState(time=time, memory=memory_context.detach())
+            self._last_context = memory_context
+            self._last_logits = logits
         return logits
 
     def self_update(self, x: Tensor, grad: Tensor):
