@@ -17,6 +17,11 @@ This entire codebase was made by OpenAI Codex (Model GPT-5.2-Codex-Max) and may 
 pip install -e .
 ```
 
+From GitHub:
+```bash
+pip install git+https://github.com/WindOfNature/Nested-Learning.git
+```
+
 Optional dependencies:
 ```bash
 pip install -e .[train]
