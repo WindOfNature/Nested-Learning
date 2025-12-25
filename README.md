@@ -2,15 +2,16 @@
 An implementation of HOPE (Capable of Self-Modifying and Continual Learning without forgetting) architecture from "Nested Learning: The Illusion of Deep Learning Architecture" by Ali Behrouz. This package provides a torch-based nested-learning framework with expressive optimizers, continuum memory systems, and optional Triton GPU kernels.
 
 ## Disclaimer
-This entire codebase was made by OpenAI Codex (Model GPT-5.2-Codex-Max) and may implement things wrong/inaccurate. This codebase is written by Codex because the owner (@WindOfNature) can't code (yet). Issues and Commits are greatly welcome to help improve this framework😁
+This entire codebase was made by OpenAI Codex (Model GPT-5.2-Codex-Max) and may implement things wrong/inaccurate. This codebase is written by Codex because the owner (@WindOfNature) can't code (yet).
+* Issues and Commits are greatly welcome to help improve this framework😁
 
 ## Features
-- Torch autograd with explicit context flow.
-- Expressive optimizers (AdamW, Muon, and memory-based variants).
-- Continuum Memory System (CMS) with multi-timescale updates and nested/sequential/head-wise variants.
-- Self-modifying module (HOPE) with self-referential titans and stacked update rules.
-- Expressive optimizer suite including Shampoo-style outer-product preconditioning.
-- CPU kernels optimized via Numba; optional GPU Triton kernels.
+* Torch autograd with explicit context flow.
+* Expressive optimizers (AdamW, Muon, and memory-based variants).
+* Continuum Memory System (CMS) with multi-timescale updates and nested/sequential/head-wise variants.
+* Self-modifying module (HOPE) with self-referential titans and stacked update rules.
+* Expressive optimizer suite including Shampoo-style outer-product preconditioning.
+* CPU kernels optimized via Numba; optional GPU Triton kernels.
 
 ## Installation
 ```bash
