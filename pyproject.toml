@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nested-learning"
+version = "0.1.0"
+description = "Nested Learning: HOPE (Self-Mod) architecture with custom kernels and optimizers"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [{name = "Nested Learning Contributors"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "numpy>=1.23",
+  "numba>=0.58",
+]
+
+[project.optional-dependencies]
+train = ["scikit-learn>=1.3"]
+gpu = ["torch>=2.1", "triton>=2.1"]
+
+[project.urls]
+Homepage = "https://example.com/nested-learning"
+
+[tool.setuptools]
+packages = ["nested_learning", "nested_learning.kernels"]
