@@ -7,6 +7,7 @@ from typing import Callable, Iterable
 
 import numpy as np
 
+from nestedlearning.kernels import GLOBAL_KERNELS
 
 BackpropFn = Callable[[], None]
 
@@ -18,6 +19,7 @@ class SimpleTensor:
     data: np.ndarray
     requires_grad: bool = True
     grad: np.ndarray | None = None
+    device: str = "cpu"
     _backward: BackpropFn = field(default=lambda: None, repr=False)
     _prev: set["SimpleTensor"] = field(default_factory=set, repr=False)
 
@@ -50,7 +52,11 @@ class SimpleTensor:
 
     def __add__(self, other: "SimpleTensor") -> "SimpleTensor":
         other = ensure_tensor(other)
-        out = SimpleTensor(self.data + other.data, requires_grad=self.requires_grad or other.requires_grad)
+        out = SimpleTensor(
+            self.data + other.data,
+            requires_grad=self.requires_grad or other.requires_grad,
+            device=self.device,
+        )
 
         def _backward() -> None:
             if self.grad is not None:
@@ -64,7 +70,12 @@ class SimpleTensor:
 
     def __matmul__(self, other: "SimpleTensor") -> "SimpleTensor":
         other = ensure_tensor(other)
-        out = SimpleTensor(self.data @ other.data, requires_grad=self.requires_grad or other.requires_grad)
+        matmul_kernel = GLOBAL_KERNELS.get("matmul", device=self.device)
+        out = SimpleTensor(
+            matmul_kernel(self.data, other.data),
+            requires_grad=self.requires_grad or other.requires_grad,
+            device=self.device,
+        )
 
         def _backward() -> None:
             if self.grad is not None:
@@ -78,7 +89,11 @@ class SimpleTensor:
 
     def __mul__(self, other: "SimpleTensor") -> "SimpleTensor":
         other = ensure_tensor(other)
-        out = SimpleTensor(self.data * other.data, requires_grad=self.requires_grad or other.requires_grad)
+        out = SimpleTensor(
+            self.data * other.data,
+            requires_grad=self.requires_grad or other.requires_grad,
+            device=self.device,
+        )
 
         def _backward() -> None:
             if self.grad is not None:
@@ -98,7 +113,7 @@ class SimpleTensor:
 
     def relu(self) -> "SimpleTensor":
         out_data = np.maximum(0, self.data)
-        out = SimpleTensor(out_data, requires_grad=self.requires_grad)
+        out = SimpleTensor(out_data, requires_grad=self.requires_grad, device=self.device)
 
         def _backward() -> None:
             if self.grad is not None:
@@ -109,7 +124,7 @@ class SimpleTensor:
         return out
 
     def sum(self) -> "SimpleTensor":
-        out = SimpleTensor(self.data.sum(), requires_grad=self.requires_grad)
+        out = SimpleTensor(self.data.sum(), requires_grad=self.requires_grad, device=self.device)
 
         def _backward() -> None:
             if self.grad is not None:

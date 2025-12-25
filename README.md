@@ -4,7 +4,8 @@ implement the Nested Learning paradigm and the HOPE (self-modifying) continual
 learning system described in "Nested Learning: The Illusion of Deep Learning
 Architecture" by Ali Behrouz et al. The initial focus is a minimal Continuum
 Memory System (CMS), a self-modifying Titan-style model, and custom optimizers
-without relying on PyTorch.
+without relying on PyTorch. The kernel registry currently defaults to NumPy CPU
+kernels and is intended to be extended with custom Triton GPU kernels.
 
 ## Install (skeleton)
 ```bash

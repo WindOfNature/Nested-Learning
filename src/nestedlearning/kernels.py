@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict
 
+import numpy as np
+
 
 KernelFn = Callable[..., object]
 
@@ -31,3 +33,15 @@ class KernelRegistry:
 
 
 GLOBAL_KERNELS = KernelRegistry()
+
+
+def register_default_kernels() -> None:
+    """Register default CPU kernels backed by NumPy."""
+
+    def matmul_cpu(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return a @ b
+
+    GLOBAL_KERNELS.register_cpu("matmul", matmul_cpu)
+
+
+register_default_kernels()
