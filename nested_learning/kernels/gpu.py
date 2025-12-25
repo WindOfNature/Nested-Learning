@@ -103,3 +103,41 @@ def matmul(a, b):
         BLOCK_K=32,
     )
     return c_t
+
+
+def layernorm(x, gamma, beta, eps: float = 1e-5):
+    torch, triton, tl = _load_triton()
+
+    @triton.jit
+    def layernorm_kernel(x_ptr, gamma_ptr, beta_ptr, y_ptr, stride_xm, stride_xn, stride_ym, stride_yn, N, EPS):
+        pid = tl.program_id(0)
+        offs = tl.arange(0, N)
+        x = tl.load(x_ptr + pid * stride_xm + offs * stride_xn, mask=offs < N, other=0.0)
+        mean = tl.sum(x, axis=0) / N
+        var = tl.sum((x - mean) * (x - mean), axis=0) / N
+        inv = tl.rsqrt(var + EPS)
+        gamma = tl.load(gamma_ptr + offs, mask=offs < N, other=1.0)
+        beta = tl.load(beta_ptr + offs, mask=offs < N, other=0.0)
+        y = (x - mean) * inv * gamma + beta
+        tl.store(y_ptr + pid * stride_ym + offs * stride_yn, y, mask=offs < N)
+
+    x_t = x if isinstance(x, torch.Tensor) else torch.as_tensor(x, device="cuda")
+    if not x_t.is_cuda:
+        raise ValueError("Triton layernorm requires CUDA tensors")
+    gamma_t = gamma if isinstance(gamma, torch.Tensor) else torch.as_tensor(gamma, device="cuda")
+    beta_t = beta if isinstance(beta, torch.Tensor) else torch.as_tensor(beta, device="cuda")
+    y = torch.empty_like(x_t)
+    grid = (x_t.shape[0],)
+    layernorm_kernel[grid](
+        x_t,
+        gamma_t,
+        beta_t,
+        y,
+        x_t.stride(0),
+        x_t.stride(1),
+        y.stride(0),
+        y.stride(1),
+        x_t.shape[1],
+        eps,
+    )
+    return y

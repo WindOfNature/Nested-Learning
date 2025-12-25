@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .nn import Linear, LayerNorm, MemoryMLP
-from .torch_optim import DGD
 
 
 @dataclass
@@ -27,9 +26,10 @@ class MemoryBlock(nn.Module):
         self.norm = LayerNorm(features)
         self.register_buffer("state_value", torch.zeros(1, features))
         self.state_time = 0
-        self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
         self.meta = MemoryMLP(features)
         self.malpha = MemoryMLP(features)
+        self._chunk_buffer: list[torch.Tensor] = []
+        self._initial_state = [p.detach().clone() for p in self.parameters()]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
@@ -38,20 +38,37 @@ class MemoryBlock(nn.Module):
         return self.norm(out)
 
     def update(self, x: torch.Tensor, time: int, update: bool = True):
-        if not update or time % self.frequency != 0:
+        if not update:
             return
+        self._chunk_buffer.append(x.detach())
+        if len(self._chunk_buffer) < self.frequency:
+            return
+        x_chunk = torch.cat(self._chunk_buffer, dim=0)
+        self._chunk_buffer = []
         with torch.enable_grad():
-            x_detached = x.detach()
-            out = self.forward(x_detached)
-            eta = F.softplus(self.meta(x_detached)).mean().clamp(min=1e-5).item()
-            alpha = torch.sigmoid(self.malpha(x_detached)).mean().clamp(min=1e-5).item()
-            loss = F.mse_loss(out, x_detached)
-            self.optimizer.zero_grad()
+            out = self.forward(x_chunk)
+            eta = F.softplus(self.meta(x_chunk)).mean().clamp(min=1e-5).item()
+            alpha = torch.sigmoid(self.malpha(x_chunk)).mean().clamp(min=1e-5).item()
+            loss = F.mse_loss(out, x_chunk)
             loss.backward()
-            self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
+            with torch.no_grad():
+                for param in self.parameters():
+                    if param.grad is None:
+                        continue
+                    param.mul_(alpha)
+                    param.add_(param.grad, alpha=-eta)
+                    param.grad = None
         with torch.no_grad():
             self.state_value.copy_(out.mean(dim=0, keepdim=True))
             self.state_time = time
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            for param, init in zip(self.parameters(), self._initial_state):
+                param.copy_(init)
+        self.state_time = 0
+        self.state_value.zero_()
+        self._chunk_buffer = []
 
     def state(self) -> MemoryState:
         return MemoryState(time=self.state_time, value=self.state_value)
@@ -75,6 +92,10 @@ class ContinuumMemorySystem(nn.Module):
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
 
+    def reset(self):
+        for block in self.blocks:
+            block.reset_parameters()
+
 
 class NestedContinuumMemorySystem(nn.Module):
     """Fully nested CMS where each block owns a sub-CMS."""
@@ -93,6 +114,8 @@ class NestedContinuumMemorySystem(nn.Module):
             block.update(context, time, update=update)
             nested_context = sub.forward(context, time, update=update)
             context = context + block.state_value + nested_context
+            if update and time % block.frequency == 0:
+                sub.reset()
         return context
 
     def states(self) -> List[MemoryState]:
@@ -101,6 +124,11 @@ class NestedContinuumMemorySystem(nn.Module):
             states.append(block.state())
             states.extend(sub.states())
         return states
+
+    def reset(self):
+        for block, sub in zip(self.blocks, self.subsystems):
+            block.reset_parameters()
+            sub.reset()
 
 
 class SequentialContinuumMemorySystem(nn.Module):
@@ -121,6 +149,10 @@ class SequentialContinuumMemorySystem(nn.Module):
 
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
+
+    def reset(self):
+        for block in self.blocks:
+            block.reset_parameters()
 
 
 class HeadwiseContinuumMemorySystem(nn.Module):
@@ -144,10 +176,15 @@ class HeadwiseContinuumMemorySystem(nn.Module):
             end = start + self.head_dim
             chunk = x[:, start:end]
             chunks.append(self.systems[head].forward(chunk, time, update=update))
-        return torch.cat(chunks, dim=-1)
+        stacked = torch.stack(chunks, dim=0)
+        return stacked.mean(dim=0)
 
     def states(self) -> List[MemoryState]:
         states: List[MemoryState] = []
         for system in self.systems:
             states.extend(system.states())
         return states
+
+    def reset(self):
+        for system in self.systems:
+            system.reset()
