@@ -95,6 +95,14 @@ def main():
     parser.add_argument("--replay-buffer", type=int, default=128)
     parser.add_argument("--self-mod-depth", type=int, default=3)
     parser.add_argument("--self-mod-query-static", action="store_true")
+    parser.add_argument("--backbone", type=str, default="titans", choices=["titans", "attention"])
+    parser.add_argument("--hope-levels", type=int, default=0)
+    parser.add_argument("--lowest-frequency", type=int, default=1)
+    parser.add_argument("--freeze-k", action="store_true")
+    parser.add_argument("--freeze-v", action="store_true")
+    parser.add_argument("--freeze-q", action="store_true")
+    parser.add_argument("--freeze-eta", action="store_true")
+    parser.add_argument("--freeze-alpha", action="store_true")
     parser.add_argument("--steered-optim", action="store_true")
     parser.add_argument("--precondition", type=str, default="outer", choices=["none", "adagrad", "adam", "outer"])
     parser.add_argument("--optimizer-state-path", type=str, default="")
@@ -112,11 +120,19 @@ def main():
     xa_train, ya_train = xa_train[: args.max_samples], ya_train[: args.max_samples]
     xb_train, yb_train = xb_train[: args.max_samples], yb_train[: args.max_samples]
 
+    projection_mask = (
+        not args.freeze_k,
+        not args.freeze_v,
+        not args.freeze_q,
+        not args.freeze_eta,
+        not args.freeze_alpha,
+    )
+
     model = HOPEModel(
         input_dim=64,
         hidden_dim=128,
         output_dim=5,
-        frequencies=[1, 5, 10],
+        frequencies=None if args.hope_levels else [1, 5, 10],
         cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
         self_mod_depth=args.self_mod_depth,
         heads=4,
@@ -127,6 +143,10 @@ def main():
         replay_steps=args.replay_steps,
         replay_buffer=args.replay_buffer,
         self_mod_query_static=args.self_mod_query_static,
+        self_mod_projection_mask=projection_mask,
+        backbone=args.backbone,
+        hope_levels=args.hope_levels or None,
+        lowest_frequency=args.lowest_frequency,
     ).to(device)
     base_optimizer = torch.optim.AdamW
     if args.steered_optim:

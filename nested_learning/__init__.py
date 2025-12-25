@@ -2,6 +2,7 @@
 
 from .nn import (
     AssociativeMemory,
+    AttentionBlock,
     Linear,
     LayerNorm,
     MLP,
@@ -34,6 +35,7 @@ __all__ = [
     "SelfModifyingStack",
     "NestedContextFlow",
     "AssociativeMemory",
+    "AttentionBlock",
     "DGD",
     "GGD",
     "GM",

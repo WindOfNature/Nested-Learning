@@ -2,50 +2,59 @@
 
 A production-grade implementation of **Nested Learning (NL)** and **HOPE** from
 *"Nested Learning: The Illusion of Deep Learning Architecture"* (Behrouz et al.).
-This repository exposes self-referential Titans, nested context-flow, a Continuum
-Memory System (CMS), and expressive optimizers that follow the NL framework.
+This repository provides self-referential Titans, nested context-flow, a Continuum
+Memory System (CMS), expressive optimizers, and optimized CPU/GPU kernels.
 
 ---
 
-## Why Nested Learning
-Nested Learning frames training as **multi-level, self-referential optimization**:
-models learn to compress context into memory, and optimizers themselves become
-associative memory modules. This codebase provides the machinery to build models
-with explicit multi-timescale updates, self-modifying behavior, and structured
-memory consolidation.
+## Disclaimer
+This codebase was generated with assistance from OpenAI Codex (GPT-5.2-Codex-Max)
+and may contain inaccuracies relative to the paper. Issues and PRs are welcome.
 
 ---
 
-## Key Features
+## Highlights
 
 - **Self-Referential Titans** with adaptive **k, v, q, η, α, memory** modules.
-- **Nested Context-Flow** (multi-level optimization) with per-level dynamics.
-- **Continuum Memory System (CMS)** with configurable update frequencies,
-  consolidation decay, and replay buffers.
-- **Associative Memory** with **parametric** and **non-parametric** (attention-like)
-  modes, including **Hebbian / Delta / Oja** learning rules.
-- **Expressive Optimizers**: DGD, GGD, GM, and a steered wrapper over `torch.optim`.
+- **Hope-Attention** variant (Titans swapped for softmax attention).
+- **Nested Context-Flow** for explicit multi-level optimization.
+- **Continuum Memory System (CMS)** with multi-timescale update, decay, and replay.
+- **Associative Memory** with parametric & non-parametric modes and **Hebbian / Delta / Oja** rules.
+- **Expressive optimizers**: DGD, GGD, GM, plus a steered wrapper over `torch.optim`.
 - **CPU (Numba) + GPU (Triton)** kernels for matmul and layernorm.
 
 ---
 
 ## Installation
 
+### 1) Local editable install
+
 ```bash
 pip install -e .
 ```
 
-Optional training extras:
+### 2) From GitHub
+
+```bash
+pip install git+https://github.com/WindOfNature/Nested-Learning.git
+```
+
+### 3) Training extras
 
 ```bash
 pip install -e .[train]
 ```
 
+### 4) Optional GPU kernels (Triton)
+
+Triton requires CUDA and a compatible PyTorch build. Once installed, the kernels
+are automatically used during inference when gradients are disabled.
+
 ---
 
 ## Quickstarts
 
-### 1) Basic HOPE forward pass
+### A) HOPE (Titans backbone)
 
 ```python
 import torch
@@ -61,13 +70,33 @@ model = HOPEModel(
     nested_depth=2,
     memory_decay=0.1,
     replay_ratio=0.2,
+    backbone="titans",
 )
 
 x = torch.randn(8, 64)
 logits = model(x, time=0)
 ```
 
-### 2) Continual learning demo (digits)
+### B) Hope-Attention
+
+```python
+import torch
+from nested_learning.hope import HOPEModel
+
+model = HOPEModel(
+    input_dim=64,
+    hidden_dim=128,
+    output_dim=10,
+    frequencies=[1, 4, 16],
+    cms_variant="nested",
+    backbone="attention",
+)
+
+x = torch.randn(8, 64)
+logits = model(x, time=0)
+```
+
+### C) Continual learning demo (digits)
 
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
@@ -80,35 +109,26 @@ PYTHONPATH=. python examples/continual_digits.py \
   --precondition outer
 ```
 
-### 3) Steered optimizer (wrap any torch optimizer)
+### D) CMS multi-level frequencies
 
 ```python
-import torch
-from nested_learning.torch_optim import ContextSteeredOptimizer, SteeredOptimizerConfig
+from nested_learning.hope import HOPEModel
 
-model = torch.nn.Linear(16, 4)
-config = SteeredOptimizerConfig(
-    precondition="outer",  # none | adagrad | adam | outer
-    memory_beta=0.9,
-    variance_beta=0.999,
-    alpha=0.5,
-    weight_decay=1e-3,
+model = HOPEModel(
+    input_dim=64,
+    hidden_dim=128,
+    output_dim=10,
+    hope_levels=3,
+    lowest_frequency=2,
+    cms_variant="nested",
 )
-optimizer = ContextSteeredOptimizer(model.parameters(), torch.optim.AdamW, config=config, lr=1e-3)
 ```
 
-### 4) Associative memory (parametric or non-parametric)
+### E) Projection-frequency ablation (freeze k/v/q)
 
-```python
-import torch
-from nested_learning.nn import AssociativeMemory
-
-keys = torch.randn(8, 32)
-values = torch.randn(8, 32)
-queries = torch.randn(4, 32)
-
-mem = AssociativeMemory(32, mode="nonparametric")
-outputs = mem(keys, values, queries)
+```bash
+PYTHONPATH=. python examples/continual_digits.py \
+  --freeze-k --freeze-v --freeze-q
 ```
 
 ---
@@ -117,57 +137,42 @@ outputs = mem(keys, values, queries)
 
 ### Self-Referential Titans
 Titans generate **k, v, q, η, α** from context and self-modify via memory modules.
-Each memory module follows the 2-layer structure described in the paper
-(Eqs. 89–91):
+Each memory module follows the 2-layer structure from the paper (Eqs. 89–91):
 
 ```
 M□(x) = x + W□,1 σ(W□,2 x)
 ```
 
-Chunk-wise updates follow the NL dual-form update scheduling (Sec. 8.2):
-- All signals for a chunk are computed *before* updates.
-- Projection memories and memory modules can use distinct chunk sizes.
+Chunk-wise updates follow NL dual-form scheduling (Sec. 8.2):
+- Signals for a chunk are computed *before* updates.
+- Projection updates and memory updates can use different chunk sizes.
 
-### Nested Context-Flow
-`NestedContextFlow` adds explicit **multi-level context optimization**:
-
-- Each level performs its own update step and normalizes the resulting context.
-- Useful for composing HOPE with deeper nested learning dynamics.
+### Hope-Attention
+Hope-Attention replaces the Titans block with a softmax attention module.
+This matches the paper’s Hope-Attention ablation (Sec. 8.3).
 
 ### Continuum Memory System (CMS)
-CMS is a chain (or nested/sequence/headwise variant) of memory blocks with distinct
-update frequencies and consolidation controls:
+CMS is a chain (or nested/sequence/headwise variant) of memory blocks with
+multi-timescale updates, consolidation, and replay:
 
-- `decay`: exponential consolidation (online → stable memory).
+- `decay`: exponential consolidation into stable memory.
 - `replay_ratio`: offline replay sampling.
-- `replay_steps`: additional replay passes.
+- `replay_steps`: extra replay passes.
 
-### Associative Memory & Learning Rules
-The library implements associative memory as in the paper’s formulation:
-
-- **Non-parametric** (Softmax/Nadaraya-Watson, Eq. 62–63).
-- **Parametric** (Titans-style memory modules).
-- Learning rules: **Hebbian**, **Delta**, **Oja** (Eq. 64–67).
+### Normalization + Convolution
+HOPE can include pre/post LayerNorms and a local convolution block, matching
+Figure 5 / Section 8 in the paper. These are configurable via `use_pre_norm`,
+`use_post_norm`, and `use_conv`.
 
 ---
 
 ## Optimizers
 
-### DGD (Delta Gradient Descent)
-Implements the paper’s DGD learning rule for memory modules.
-
-### GGD (Generalized Gradient Descent)
-Implements the self-referential update formulation (Eq. 59–60), where values
-are generated from the model state itself.
-
-### GM (Generalized Momentum)
-Extends GGD with explicit momentum memory, preserving knowledge across phases.
-
-### ContextSteeredOptimizer
-Wraps any `torch.optim` optimizer and steers gradients via associative-memory
-preconditioning:
-
-- `none`, `adagrad`, `adam`, `outer` (outer-product preconditioning).
+- **DGD**: Delta Gradient Descent (paper’s memory update rule).
+- **GGD**: Generalized Gradient Descent (self-referential values, Eq. 59–60).
+- **GM**: Generalized Momentum with persistent memory.
+- **ContextSteeredOptimizer**: wraps any `torch.optim` optimizer and applies
+  associative-memory preconditioning (`none`, `adagrad`, `adam`, `outer`).
 
 ---
 
@@ -180,17 +185,25 @@ HOPEModel(
     input_dim: int,
     hidden_dim: int,
     output_dim: int,
-    frequencies: list[int],
+    frequencies: list[int] | None,
     cms_variant: str = "nested",  # nested | sequential | headwise | chain
     self_mod_depth: int = 2,
     heads: int = 4,
     self_mod_query_static: bool = False,
+    self_mod_projection_mask: tuple[bool, bool, bool, bool, bool] | None = None,
+    backbone: str = "titans",  # titans | attention
+    hope_levels: int | None = None,
+    lowest_frequency: int = 1,
     nested_depth: int = 0,
     nested_hidden: int = 128,
     memory_decay: float = 0.0,
     replay_ratio: float = 0.0,
     replay_steps: int = 1,
     replay_buffer: int = 128,
+    use_conv: bool = True,
+    conv_kernel: int = 3,
+    use_pre_norm: bool = True,
+    use_post_norm: bool = True,
 )
 ```
 
@@ -202,8 +215,6 @@ HOPEModel(
 
 ## Optimizer State Persistence (Continual Learning)
 
-You can preserve optimizer memory across tasks:
-
 ```python
 from nested_learning.torch_optim import save_optimizer_state, load_optimizer_state
 
@@ -213,12 +224,16 @@ load_optimizer_state(optimizer, "optim_state.pt")
 
 ---
 
-## Kernels
+## Proof of Concept (Digits)
 
-- **CPU**: Numba-accelerated matmul + layernorm (`nested_learning.kernels.cpu`)
-- **GPU**: Triton matmul + layernorm (`nested_learning.kernels.gpu`)
+Example run (as in the paper’s continual-learning style setup):
 
-LayerNorm dispatches to Triton when CUDA is available and gradients are disabled.
+```
+Task A accuracy before: 0.287
+Task B accuracy: 0.228
+Task A accuracy after: 0.287
+Forgetting: 0.000
+```
 
 ---
 
@@ -227,7 +242,7 @@ LayerNorm dispatches to Triton when CUDA is available and gradients are disabled
 ```
 nested_learning/
   hope.py            # HOPE architecture
-  nn.py              # Titans, AssociativeMemory, ContextFlow, core layers
+  nn.py              # Titans, Attention, AssociativeMemory, ContextFlow
   memory.py          # CMS variants
   torch_optim.py     # DGD / GGD / GM + steered optimizer
   kernels/

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -149,6 +149,36 @@ class AssociativeMemory(nn.Module):
             self.state = AssociativeMemoryState(memory=self.memory, time=self.state.time + 1)
 
 
+class AttentionBlock(nn.Module):
+    """Softmax attention block used for Hope-Attention variants."""
+
+    def __init__(self, features: int, heads: int = 4, bias: bool = True):
+        super().__init__()
+        if features % heads != 0:
+            raise ValueError("features must be divisible by heads")
+        self.heads = heads
+        self.head_dim = features // heads
+        self.scale = self.head_dim**-0.5
+        self.q_proj = Linear(features, features, bias=bias)
+        self.k_proj = Linear(features, features, bias=bias)
+        self.v_proj = Linear(features, features, bias=bias)
+        self.out_proj = Linear(features, features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        batch, seq_len, features = x.shape
+        q = self.q_proj(x).view(batch, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(batch, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(batch, seq_len, self.heads, self.head_dim).transpose(1, 2)
+        attn = (q @ k.transpose(-1, -2)) * self.scale
+        weights = torch.softmax(attn, dim=-1)
+        out = weights @ v
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, features)
+        out = self.out_proj(out)
+        return out.squeeze(1)
+
+
 @dataclass
 class MemorySignals:
     k: torch.Tensor
@@ -192,23 +222,29 @@ class SelfReferentialTitan(nn.Module):
         signals: MemorySignals,
         update_memory: bool = True,
         update_projections: bool = True,
+        projection_mask: Sequence[bool] | None = None,
     ):
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
 
         v_hat = signals.v.detach()
         if update_projections:
+            projection_mask = projection_mask or (True, True, True, True, True)
             v_hat_k = self.mk(v_hat)
             v_hat_v = self.mv(v_hat)
             v_hat_eta = self.meta(v_hat)
             v_hat_alpha = self.malpha(v_hat)
-            self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
-            self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
-            if self.q_proj is None:
+            if projection_mask[0]:
+                self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
+            if projection_mask[1]:
+                self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
+            if projection_mask[2] and self.q_proj is None:
                 v_hat_q = self.mq(v_hat)
                 self.mq.dgd_update(signals.k.detach(), v_hat_q.detach(), lr=eta, weight_decay=alpha)
-            self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
-            self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
+            if projection_mask[3]:
+                self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
+            if projection_mask[4]:
+                self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
         if update_memory:
             v_hat_memory = self.mmemory(v_hat)
             self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
@@ -219,7 +255,13 @@ class SelfReferentialTitan(nn.Module):
         x_detached = x.detach()
         return self.generate_signals(x_detached)
 
-    def update_chunk(self, x: torch.Tensor, chunk_size: int | None = None, memory_chunk_size: int | None = None):
+    def update_chunk(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ):
         chunk_size = chunk_size or x.shape[0]
         memory_chunk_size = memory_chunk_size or chunk_size
         if chunk_size <= 0 or memory_chunk_size <= 0:
@@ -227,7 +269,12 @@ class SelfReferentialTitan(nn.Module):
         for start in range(0, x.shape[0], chunk_size):
             chunk = x[start : start + chunk_size]
             signals = self._compute_signals(chunk)
-            self._update_modules(signals, update_memory=False, update_projections=True)
+            self._update_modules(
+                signals,
+                update_memory=False,
+                update_projections=True,
+                projection_mask=projection_mask,
+            )
         for start in range(0, x.shape[0], memory_chunk_size):
             chunk = x[start : start + memory_chunk_size]
             signals = self._compute_signals(chunk)
@@ -258,9 +305,20 @@ class SelfModifyingStack(nn.Module):
             out = F.relu(layer(out))
         return out
 
-    def update_chunk(self, x: torch.Tensor, chunk_size: int | None = None, memory_chunk_size: int | None = None):
+    def update_chunk(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ):
         for layer in self.layers:
-            layer.update_chunk(x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
+            layer.update_chunk(
+                x,
+                chunk_size=chunk_size,
+                memory_chunk_size=memory_chunk_size,
+                projection_mask=projection_mask,
+            )
 
 
 @dataclass

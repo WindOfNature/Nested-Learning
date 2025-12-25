@@ -207,7 +207,7 @@ class ContextSteeredOptimizer:
         elif cfg.precondition == "adam":
             steered = delta / (variance.sqrt() + cfg.eps)
         elif cfg.precondition == "outer":
-            if param.dim() < 2:
+            if param.dim() != 2:
                 steered = delta / (variance.sqrt() + cfg.eps)
             else:
                 left = state["left"]
