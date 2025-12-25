@@ -49,8 +49,11 @@ class LayerNorm(nn.Module):
         self.use_kernels = use_kernels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_kernels and not torch.is_grad_enabled() and not x.is_cuda:
-            return cpu_kernels.layernorm_torch(x, self.gamma, self.beta, self.eps)
+        if self.use_kernels and not torch.is_grad_enabled():
+            if x.is_cuda and gpu_kernels.available().available:
+                return gpu_kernels.layernorm(x, self.gamma, self.beta, self.eps)
+            if not x.is_cuda:
+                return cpu_kernels.layernorm_torch(x, self.gamma, self.beta, self.eps)
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, keepdim=True, unbiased=False)
         return (x - mean) / torch.sqrt(var + self.eps) * self.gamma + self.beta
@@ -101,7 +104,7 @@ class MemorySignals:
 class SelfReferentialTitan(nn.Module):
     """Self-referential module with explicit memories for {k, v, q, eta, alpha, memory}."""
 
-    def __init__(self, features: int, update_hidden: int = 64):
+    def __init__(self, features: int, update_hidden: int = 64, query_static: bool = False):
         super().__init__()
         self.mk = MemoryMLP(features, hidden_features=update_hidden)
         self.mv = MemoryMLP(features, hidden_features=update_hidden)
@@ -109,6 +112,8 @@ class SelfReferentialTitan(nn.Module):
         self.meta = MemoryMLP(features, hidden_features=update_hidden)
         self.malpha = MemoryMLP(features, hidden_features=update_hidden)
         self.mmemory = MemoryMLP(features, hidden_features=update_hidden)
+        self.query_static = query_static
+        self.q_proj = Linear(features, features) if query_static else None
         self.scale = nn.Parameter(torch.ones(features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -116,7 +121,7 @@ class SelfReferentialTitan(nn.Module):
         return x + signals.memory
 
     def generate_signals(self, x: torch.Tensor) -> MemorySignals:
-        q = self.mq(x)
+        q = self.q_proj(x) if self.q_proj is not None else self.mq(x)
         k = self.mk(x)
         v = self.mv(x)
         eta = F.softplus(self.meta(x))
@@ -124,36 +129,64 @@ class SelfReferentialTitan(nn.Module):
         memory = self.mmemory(q)
         return MemorySignals(k=k, v=v, q=q, eta=eta, alpha=alpha, memory=memory)
 
-    def update_chunk(self, x: torch.Tensor):
+    def _update_modules(
+        self,
+        x: torch.Tensor,
+        update_memory: bool = True,
+        update_projections: bool = True,
+    ):
         x_detached = x.detach()
         signals = self.generate_signals(x_detached)
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
 
-        v_hat_k = self.mk(signals.v.detach())
-        v_hat_v = self.mv(signals.v.detach())
-        v_hat_q = self.mq(signals.v.detach())
-        v_hat_eta = self.meta(signals.v.detach())
-        v_hat_alpha = self.malpha(signals.v.detach())
-        v_hat_memory = self.mmemory(signals.v.detach())
+        v_hat = signals.v.detach()
+        if update_projections:
+            v_hat_k = self.mk(v_hat)
+            v_hat_v = self.mv(v_hat)
+            v_hat_eta = self.meta(v_hat)
+            v_hat_alpha = self.malpha(v_hat)
+            self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
+            self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
+            if self.q_proj is None:
+                v_hat_q = self.mq(v_hat)
+                self.mq.dgd_update(signals.k.detach(), v_hat_q.detach(), lr=eta, weight_decay=alpha)
+            self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
+            self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
+        if update_memory:
+            v_hat_memory = self.mmemory(v_hat)
+            self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
+            with torch.no_grad():
+                self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
 
-        self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
-        self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
-        self.mq.dgd_update(signals.k.detach(), v_hat_q.detach(), lr=eta, weight_decay=alpha)
-        self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
-        self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
-        self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
-
-        with torch.no_grad():
-            self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
+    def update_chunk(self, x: torch.Tensor, chunk_size: int | None = None, memory_chunk_size: int | None = None):
+        chunk_size = chunk_size or x.shape[0]
+        memory_chunk_size = memory_chunk_size or chunk_size
+        if chunk_size <= 0 or memory_chunk_size <= 0:
+            raise ValueError("chunk_size and memory_chunk_size must be positive")
+        for start in range(0, x.shape[0], chunk_size):
+            self._update_modules(x[start : start + chunk_size], update_memory=False, update_projections=True)
+        for start in range(0, x.shape[0], memory_chunk_size):
+            self._update_modules(x[start : start + memory_chunk_size], update_memory=True, update_projections=False)
 
 
 class SelfModifyingStack(nn.Module):
     """Stacked self-referential titans for deeper self-modifying updates."""
 
-    def __init__(self, features: int, depth: int = 2, update_hidden: int = 64):
+    def __init__(
+        self,
+        features: int,
+        depth: int = 2,
+        update_hidden: int = 64,
+        query_static: bool = False,
+    ):
         super().__init__()
-        self.layers = nn.ModuleList([SelfReferentialTitan(features, update_hidden=update_hidden) for _ in range(depth)])
+        self.layers = nn.ModuleList(
+            [
+                SelfReferentialTitan(features, update_hidden=update_hidden, query_static=query_static)
+                for _ in range(depth)
+            ]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
@@ -161,6 +194,64 @@ class SelfModifyingStack(nn.Module):
             out = F.relu(layer(out))
         return out
 
-    def update_chunk(self, x: torch.Tensor):
+    def update_chunk(self, x: torch.Tensor, chunk_size: int | None = None, memory_chunk_size: int | None = None):
         for layer in self.layers:
-            layer.update_chunk(x)
+            layer.update_chunk(x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
+
+
+@dataclass
+class ContextFlowState:
+    time: int
+    level: int
+    context: torch.Tensor
+
+
+class ContextFlowLevel(nn.Module):
+    """Single level of nested context flow with its own optimization dynamics."""
+
+    def __init__(self, features: int, hidden: int = 128):
+        super().__init__()
+        self.transform = nn.Sequential(
+            Linear(features, hidden),
+            nn.ReLU(),
+            Linear(hidden, features),
+        )
+        self.norm = LayerNorm(features)
+        self.meta = MemoryMLP(features)
+        self.malpha = MemoryMLP(features)
+        self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
+        self.state = ContextFlowState(time=0, level=0, context=torch.zeros(1, features))
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        return self.norm(context + self.transform(context))
+
+    def update(self, context: torch.Tensor, time: int):
+        with torch.enable_grad():
+            context_detached = context.detach()
+            eta = F.softplus(self.meta(context_detached)).mean().clamp(min=1e-5).item()
+            alpha = torch.sigmoid(self.malpha(context_detached)).mean().clamp(min=1e-5).item()
+            output = self.forward(context_detached)
+            target = context_detached + self.transform(context_detached).detach()
+            loss = F.mse_loss(output, target)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
+        with torch.no_grad():
+            self.state = ContextFlowState(time=time, level=self.state.level, context=output.mean(dim=0, keepdim=True))
+
+
+class NestedContextFlow(nn.Module):
+    """Nested multi-level context flow module."""
+
+    def __init__(self, features: int, depth: int = 2, hidden: int = 128):
+        super().__init__()
+        self.levels = nn.ModuleList([ContextFlowLevel(features, hidden=hidden) for _ in range(depth)])
+
+    def forward(self, context: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
+        flow = context
+        for idx, level in enumerate(self.levels):
+            if update:
+                level.state = ContextFlowState(time=time, level=idx, context=flow.detach())
+                level.update(flow, time)
+            flow = level.forward(flow)
+        return flow

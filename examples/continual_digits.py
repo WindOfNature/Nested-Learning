@@ -10,6 +10,7 @@ from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 
 from nested_learning.hope import HOPEModel
+from nested_learning.torch_optim import ContextSteeredOptimizer, SteeredOptimizerConfig
 
 
 def prepare_tasks():
@@ -31,6 +32,7 @@ def train_task(
     device: torch.device,
     rng: np.random.Generator,
     chunk_size: int,
+    memory_chunk_size: int,
 ):
     model.train()
     for epoch in range(epochs):
@@ -48,13 +50,13 @@ def train_task(
             chunk_buffer.append(batch_x)
             if (step // batch_size + 1) % chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
-                model.update_chunk(chunk_x)
+                model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
                 chunk_buffer = []
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
         if chunk_buffer:
             chunk_x = torch.cat(chunk_buffer, dim=0)
-            model.update_chunk(chunk_x)
+            model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
 
 
 def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int, device: torch.device) -> float:
@@ -78,6 +80,18 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--chunk-size", type=int, default=4)
+    parser.add_argument("--memory-chunk-size", type=int, default=4)
+    parser.add_argument("--cms-variant", type=str, default="nested", choices=["nested", "sequential", "headwise", "chain"])
+    parser.add_argument("--nested-depth", type=int, default=2)
+    parser.add_argument("--nested-hidden", type=int, default=128)
+    parser.add_argument("--memory-decay", type=float, default=0.1)
+    parser.add_argument("--replay-ratio", type=float, default=0.2)
+    parser.add_argument("--replay-steps", type=int, default=1)
+    parser.add_argument("--replay-buffer", type=int, default=128)
+    parser.add_argument("--self-mod-depth", type=int, default=3)
+    parser.add_argument("--self-mod-query-static", action="store_true")
+    parser.add_argument("--steered-optim", action="store_true")
+    parser.add_argument("--precondition", type=str, default="outer", choices=["none", "adagrad", "adam", "outer"])
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -96,11 +110,23 @@ def main():
         hidden_dim=128,
         output_dim=5,
         frequencies=[1, 5, 10],
-        cms_variant="nested",
-        self_mod_depth=3,
+        cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
+        self_mod_depth=args.self_mod_depth,
         heads=4,
+        nested_depth=args.nested_depth,
+        nested_hidden=args.nested_hidden,
+        memory_decay=args.memory_decay,
+        replay_ratio=args.replay_ratio,
+        replay_steps=args.replay_steps,
+        replay_buffer=args.replay_buffer,
+        self_mod_query_static=args.self_mod_query_static,
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3)
+    base_optimizer = torch.optim.AdamW
+    if args.steered_optim:
+        config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
+        optimizer = ContextSteeredOptimizer(model.parameters(), base_optimizer, config=config, lr=1e-3)
+    else:
+        optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
     train_task(
         model,
@@ -112,6 +138,7 @@ def main():
         device=device,
         rng=rng,
         chunk_size=args.chunk_size,
+        memory_chunk_size=args.memory_chunk_size,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
 
@@ -125,6 +152,7 @@ def main():
         device=device,
         rng=rng,
         chunk_size=args.chunk_size,
+        memory_chunk_size=args.memory_chunk_size,
     )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
