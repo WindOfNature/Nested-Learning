@@ -61,3 +61,4 @@ Task A accuracy after: 0.182
 Forgetting: -0.006
 ```
 * (this run is only 200 samples due to Codex enviro limitations)
+* and i also noticed that HOPE is bad for vision(atleast for now or codex forgot/get wrong implementing stuff), i think the main reason it is bad at these vision task because of CMS(Continuum Memory System) which update it's state everytime which mutate it or it just need a bigger architectire(this is only 128 dim) and need feature extractor(CNN)
