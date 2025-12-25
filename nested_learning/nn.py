@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional
+from dataclasses import dataclass
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -65,66 +66,94 @@ class MLP(nn.Module):
         return self.fc2(F.relu(self.fc1(x)))
 
 
-class SelfModifyingLayer(nn.Module):
-    """Layer with learned update rule for self-modification."""
+class MemoryMLP(nn.Module):
+    """Memory module M□(·) = (·) + W1 σ(W2 (·))."""
 
-    def __init__(self, features: int, update_hidden: int = 64):
+    def __init__(self, features: int, hidden_features: int | None = None):
         super().__init__()
-        self.base = Linear(features, features)
-        self.rule = MLP(features * 2, update_hidden, features)
-        self.scale = nn.Parameter(torch.ones(features))
-        self.base_optimizer = DGD(self.base.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
+        hidden = hidden_features or features * 2
+        self.fc1 = Linear(features, hidden)
+        self.fc2 = Linear(hidden, features)
+        self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.relu(self.base(x))
+        return x + self.fc2(F.relu(self.fc1(x)))
 
-    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
-        x_detached = x.detach()
-        grad_detached = grad.detach()
-        context = torch.cat([x_detached, grad_detached], dim=-1)
-        delta = torch.tanh(self.rule(context))
-        target = x_detached + grad_detached
-        pred = self.base(x_detached)
-        loss = F.mse_loss(pred, target)
-        self.base_optimizer.zero_grad()
-        loss.backward()
-        self.base_optimizer.step()
-        with torch.no_grad():
-            self.base.weight.add_(self.scale * delta.mean(dim=0))
+    def dgd_update(self, keys: torch.Tensor, targets: torch.Tensor, lr: float, weight_decay: float):
+        with torch.enable_grad():
+            pred = self.forward(keys)
+            loss = F.mse_loss(pred, targets)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step(lr_override=lr, weight_decay_override=weight_decay)
+
+
+@dataclass
+class MemorySignals:
+    k: torch.Tensor
+    v: torch.Tensor
+    q: torch.Tensor
+    eta: torch.Tensor
+    alpha: torch.Tensor
+    memory: torch.Tensor
 
 
 class SelfReferentialTitan(nn.Module):
-    """Self-referential module with an inner optimizer for its update rule."""
+    """Self-referential module with explicit memories for {k, v, q, eta, alpha, memory}."""
 
-    def __init__(self, features: int, update_hidden: int = 64, inner_lr: float = 1e-3):
+    def __init__(self, features: int, update_hidden: int = 64):
         super().__init__()
-        self.core = SelfModifyingLayer(features, update_hidden=update_hidden)
-        self.rule_optimizer = torch.optim.AdamW(self.core.rule.parameters(), lr=inner_lr, weight_decay=1e-4)
+        self.mk = MemoryMLP(features, hidden_features=update_hidden)
+        self.mv = MemoryMLP(features, hidden_features=update_hidden)
+        self.mq = MemoryMLP(features, hidden_features=update_hidden)
+        self.meta = MemoryMLP(features, hidden_features=update_hidden)
+        self.malpha = MemoryMLP(features, hidden_features=update_hidden)
+        self.mmemory = MemoryMLP(features, hidden_features=update_hidden)
+        self.scale = nn.Parameter(torch.ones(features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.core(x)
+        signals = self.generate_signals(x)
+        return x + signals.memory
 
-    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
+    def generate_signals(self, x: torch.Tensor) -> MemorySignals:
+        q = self.mq(x)
+        k = self.mk(x)
+        v = self.mv(x)
+        eta = F.softplus(self.meta(x))
+        alpha = torch.sigmoid(self.malpha(x))
+        memory = self.mmemory(q)
+        return MemorySignals(k=k, v=v, q=q, eta=eta, alpha=alpha, memory=memory)
+
+    def update_chunk(self, x: torch.Tensor):
         x_detached = x.detach()
-        grad_detached = grad.detach()
-        self.core.self_update(x_detached, grad_detached)
-        target = -grad_detached
-        context = torch.cat([x_detached, grad_detached], dim=-1)
-        pred = self.core.rule(context)
-        loss = F.mse_loss(pred, target)
-        self.rule_optimizer.zero_grad()
-        loss.backward()
-        self.rule_optimizer.step()
+        signals = self.generate_signals(x_detached)
+        eta = signals.eta.mean().clamp(min=1e-5).item()
+        alpha = signals.alpha.mean().clamp(min=1e-5).item()
+
+        v_hat_k = self.mk(signals.v.detach())
+        v_hat_v = self.mv(signals.v.detach())
+        v_hat_q = self.mq(signals.v.detach())
+        v_hat_eta = self.meta(signals.v.detach())
+        v_hat_alpha = self.malpha(signals.v.detach())
+        v_hat_memory = self.mmemory(signals.v.detach())
+
+        self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
+        self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
+        self.mq.dgd_update(signals.k.detach(), v_hat_q.detach(), lr=eta, weight_decay=alpha)
+        self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
+        self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
+        self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
+
+        with torch.no_grad():
+            self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
 
 
 class SelfModifyingStack(nn.Module):
-    """Stacked self-modifying titans for deeper self-referential updates."""
+    """Stacked self-referential titans for deeper self-modifying updates."""
 
-    def __init__(self, features: int, depth: int = 2, update_hidden: int = 64, inner_lr: float = 1e-3):
+    def __init__(self, features: int, depth: int = 2, update_hidden: int = 64):
         super().__init__()
-        self.layers = nn.ModuleList(
-            [SelfReferentialTitan(features, update_hidden=update_hidden, inner_lr=inner_lr) for _ in range(depth)]
-        )
+        self.layers = nn.ModuleList([SelfReferentialTitan(features, update_hidden=update_hidden) for _ in range(depth)])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
@@ -132,6 +161,6 @@ class SelfModifyingStack(nn.Module):
             out = F.relu(layer(out))
         return out
 
-    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
+    def update_chunk(self, x: torch.Tensor):
         for layer in self.layers:
-            layer.self_update(x, grad)
+            layer.update_chunk(x)

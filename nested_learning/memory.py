@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .nn import Linear, LayerNorm
+from .nn import Linear, LayerNorm, MemoryMLP
 from .torch_optim import DGD
 
 
@@ -28,6 +28,8 @@ class MemoryBlock(nn.Module):
         self.register_buffer("state_value", torch.zeros(1, features))
         self.state_time = 0
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
+        self.meta = MemoryMLP(features)
+        self.malpha = MemoryMLP(features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
@@ -41,10 +43,12 @@ class MemoryBlock(nn.Module):
         with torch.enable_grad():
             x_detached = x.detach()
             out = self.forward(x_detached)
+            eta = F.softplus(self.meta(x_detached)).mean().clamp(min=1e-5).item()
+            alpha = torch.sigmoid(self.malpha(x_detached)).mean().clamp(min=1e-5).item()
             loss = F.mse_loss(out, x_detached)
             self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step()
+            self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
         with torch.no_grad():
             self.state_value.copy_(out.mean(dim=0, keepdim=True))
             self.state_time = time

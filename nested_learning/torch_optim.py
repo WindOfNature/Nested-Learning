@@ -22,16 +22,16 @@ class DGD(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure=None, lr_override: float | None = None, weight_decay_override: float | None = None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
         for group in self.param_groups:
-            lr = group["lr"]
+            lr = group["lr"] if lr_override is None else lr_override
             beta = group["beta"]
             alpha = group["alpha"]
-            weight_decay = group["weight_decay"]
+            weight_decay = group["weight_decay"] if weight_decay_override is None else weight_decay_override
             for param in group["params"]:
                 if param.grad is None:
                     continue

@@ -65,14 +65,15 @@ class HOPEModel(nn.Module):
             self._last_logits = logits
         return logits
 
-    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
-        self.self_mod.self_update(x, grad)
+    def update_chunk(self, x: torch.Tensor):
+        encoded = F.relu(self.encoder(x))
+        self.self_mod.update_chunk(encoded)
 
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:
             return
         grad_hidden = self._last_logits.grad @ self.decoder.weight.t()
-        self.self_mod.self_update(self._last_context, grad_hidden)
+        self.self_mod.update_chunk(self._last_context + grad_hidden)
 
     def reset(self):
         self.state = HopeState(time=0, memory=torch.zeros_like(self.state.memory))

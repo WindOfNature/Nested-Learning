@@ -30,10 +30,12 @@ def train_task(
     batch_size: int,
     device: torch.device,
     rng: np.random.Generator,
+    chunk_size: int,
 ):
     model.train()
     for epoch in range(epochs):
         indices = rng.permutation(len(x))
+        chunk_buffer = []
         for step in range(0, len(indices), batch_size):
             batch_idx = indices[step : step + batch_size]
             batch_x = torch.tensor(x[batch_idx], device=device)
@@ -43,8 +45,16 @@ def train_task(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            chunk_buffer.append(batch_x)
+            if (step // batch_size + 1) % chunk_size == 0:
+                chunk_x = torch.cat(chunk_buffer, dim=0)
+                model.update_chunk(chunk_x)
+                chunk_buffer = []
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
+        if chunk_buffer:
+            chunk_x = torch.cat(chunk_buffer, dim=0)
+            model.update_chunk(chunk_x)
 
 
 def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int, device: torch.device) -> float:
@@ -67,6 +77,7 @@ def main():
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--chunk-size", type=int, default=4)
     args = parser.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -100,6 +111,7 @@ def main():
         batch_size=args.batch_size,
         device=device,
         rng=rng,
+        chunk_size=args.chunk_size,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
 
@@ -112,6 +124,7 @@ def main():
         batch_size=args.batch_size,
         device=device,
         rng=rng,
+        chunk_size=args.chunk_size,
     )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)

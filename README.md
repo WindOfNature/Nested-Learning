@@ -1,12 +1,12 @@
 # Nested-Learning
-An implementation of HOPE (Capable of Self-Modifying and Continual Learning without forgetting) architecture from "Nested Learning: The Illusion of Deep Learning Architecture" by Ali Behrouz. This package provides a torch-free nested-learning framework with custom backprop, expressive optimizers, continuum memory systems, and optional Triton GPU kernels.
+An implementation of HOPE (Capable of Self-Modifying and Continual Learning without forgetting) architecture from "Nested Learning: The Illusion of Deep Learning Architecture" by Ali Behrouz. This package provides a torch-based nested-learning framework with expressive optimizers, continuum memory systems, and optional Triton GPU kernels.
 
 ## Disclaimer
 This entire codebase was made by OpenAI Codex (Model GPT-5.2-Codex-Max) and may implement things wrong/inaccurate. This codebase is written by Codex because the owner (@WindOfNature) can't code (yet).
 
 ## Features
-- Custom autograd engine with explicit context flow.
-- Expressive optimizers (Adam, AdamW, Muon, and memory-based variants).
+- Torch autograd with explicit context flow.
+- Expressive optimizers (AdamW, Muon, and memory-based variants).
 - Continuum Memory System (CMS) with multi-timescale updates and nested/sequential/head-wise variants.
 - Self-modifying module (HOPE) with self-referential titans and stacked update rules.
 - Expressive optimizer suite including Shampoo-style outer-product preconditioning.
@@ -24,16 +24,16 @@ pip install -e .[train]
 
 ## Quickstart
 ```python
+import torch
+
 from nested_learning.hope import HOPEModel
-from nested_learning.tensor import Tensor, cross_entropy
-from nested_learning.optim import AdamW
 
 model = HOPEModel(input_dim=64, hidden_dim=128, output_dim=10, frequencies=[1, 4, 16], cms_variant="nested", self_mod_depth=3)
-optimizer = AdamW(model.parameters(), lr=1e-3)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-x = Tensor.randn((1, 64), requires_grad=True)
+x = torch.randn(1, 64)
 logits = model.forward(x, time=0)
-loss = cross_entropy(logits, targets=[1])
+loss = torch.nn.functional.cross_entropy(logits, torch.tensor([1]))
 optimizer.zero_grad()
 loss.backward()
 optimizer.step()
