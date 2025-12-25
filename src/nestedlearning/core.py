@@ -84,19 +84,20 @@ class SelfModifyingModel(NestedModule):
 class HopeTrainer:
     """Coordinator for continual learning with self-modification and memory."""
 
-    model: SelfModifyingModel
-    optimizer: NestedOptimizer
-    memory: ContinuumMemory
+    model: Any
+    optimizer: Any
+    memory: Any
 
     def fit(self, dataset: Iterable[Any]) -> None:
         """Train model over dataset with nested updates."""
-        for batch in dataset:
-            self.model.push_context(batch)
-            self.optimizer.step(batch)
-            self.memory.write(batch)
+        for inputs, targets in dataset:
+            loss = self.model.loss(inputs, targets)
+            self.model.self_modify(loss, self.optimizer)
+            self.memory.write((inputs, targets))
 
     def continual_update(self, context: Any) -> None:
         """Apply an online continual update."""
-        self.model.push_context(context)
-        self.model.self_modify(context)
+        inputs, targets = context
+        loss = self.model.loss(inputs, targets)
+        self.model.self_modify(loss, self.optimizer)
         self.memory.write(context)
