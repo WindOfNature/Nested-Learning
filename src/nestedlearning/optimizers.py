@@ -70,3 +70,28 @@ class Muon(Optimizer):
 
     def step(self) -> None:
         raise NotImplementedError("Muon optimizer is not implemented yet.")
+
+
+@dataclass
+class DeltaGradientDescent(Optimizer):
+    """Delta Gradient Descent with optional normalization.
+
+    Expects a single weight matrix and context (input, grad_output) to update.
+    """
+
+    alpha: float = 1e-3
+    beta: float = 1e-3
+    eps: float = 1e-8
+
+    def step(self) -> None:
+        raise NotImplementedError("Use step_with_context for DeltaGradientDescent.")
+
+    def step_with_context(self, param: SimpleTensor, x: np.ndarray, grad_y: np.ndarray) -> None:
+        if param.data.ndim != 2:
+            raise ValueError("DeltaGradientDescent expects a 2D weight matrix.")
+        x_vec = x.reshape(-1, 1).astype(np.float32)
+        grad_y_vec = grad_y.reshape(-1, 1).astype(np.float32)
+        norm = float(x_vec.T @ x_vec) + self.eps
+        alpha = self.alpha / norm
+        identity = np.eye(x_vec.shape[0], dtype=np.float32)
+        param.data = param.data @ (identity - alpha * (x_vec @ x_vec.T)) - self.beta * (grad_y_vec @ x_vec.T)

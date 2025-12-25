@@ -28,3 +28,7 @@ inputs = SimpleTensor(np.ones((1, 4)))
 targets = SimpleTensor(np.zeros((1, 2)))
 trainer.continual_update((inputs, targets))
 ```
+
+## Optimizers
+- `Adam`, `AdamW`
+- `DeltaGradientDescent` (context-aware update rule based on the paper)

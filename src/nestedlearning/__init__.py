@@ -4,7 +4,7 @@ from nestedlearning.core import HopeTrainer, NestedModule, NestedOptimizer, Self
 from nestedlearning.kernels import GLOBAL_KERNELS, KernelRegistry
 from nestedlearning.memory import ContinuumMemorySystem
 from nestedlearning.models import SelfModifyingTitan
-from nestedlearning.optimizers import Adam, AdamW, Muon, Optimizer
+from nestedlearning.optimizers import Adam, AdamW, DeltaGradientDescent, Muon, Optimizer
 from nestedlearning.tensor import SimpleTensor, mse_loss
 from nestedlearning.version import __version__
 
@@ -21,6 +21,7 @@ __all__ = [
     "Optimizer",
     "Adam",
     "AdamW",
+    "DeltaGradientDescent",
     "Muon",
     "SimpleTensor",
     "mse_loss",
