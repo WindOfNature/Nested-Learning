@@ -1,184 +1,137 @@
-"""Neural modules with nested-learning inspired updates."""
+"""Torch-based neural modules with Nested Learning inspired updates."""
 
 from __future__ import annotations
 
 from typing import Iterable, List, Optional
 
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from .tensor import Tensor
 from .kernels import cpu as cpu_kernels
-from .optim import DGD
+from .kernels import gpu as gpu_kernels
+from .torch_optim import DGD
 
 
-class Module:
-    def __init__(self):
-        self.training = True
-
-    def parameters(self) -> List[Tensor]:
-        params: List[Tensor] = []
-        for attr in self.__dict__.values():
-            if isinstance(attr, Tensor):
-                params.append(attr)
-            elif isinstance(attr, Module):
-                params.extend(attr.parameters())
-            elif isinstance(attr, (list, tuple)):
-                for item in attr:
-                    if isinstance(item, Module):
-                        params.extend(item.parameters())
-                    elif isinstance(item, Tensor):
-                        params.append(item)
-        return params
-
-    def train(self):
-        self.training = True
-
-    def eval(self):
-        self.training = False
-
-    def __call__(self, *args, **kwargs):
-        return self.forward(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError
-
-
-class Linear(Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, seed: Optional[int] = None):
+class Linear(nn.Module):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, use_kernels: bool = True):
         super().__init__()
-        scale = np.sqrt(2.0 / in_features)
-        self.weight = Tensor.randn((in_features, out_features), requires_grad=True, seed=seed, name="weight")
-        self.weight.data *= scale
-        self.bias = Tensor.zeros((out_features,), requires_grad=True, name="bias") if bias else None
+        scale = (2.0 / in_features) ** 0.5
+        weight = torch.randn(in_features, out_features) * scale
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.use_kernels = use_kernels
 
-    def forward(self, x: Tensor) -> Tensor:
-        if x.data.ndim == 1:
-            x = Tensor(x.data[None, :], requires_grad=x.requires_grad)
-        out = x @ self.weight
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        if self.use_kernels and not torch.is_grad_enabled():
+            if x.is_cuda and gpu_kernels.available().available:
+                out = gpu_kernels.matmul(x, self.weight)
+            elif not x.is_cuda:
+                out = cpu_kernels.matmul_torch(x, self.weight)
+            else:
+                out = x @ self.weight
+        else:
+            out = x @ self.weight
         if self.bias is not None:
             out = out + self.bias
         return out
 
 
-class LayerNorm(Module):
-    def __init__(self, features: int, eps: float = 1e-5):
+class LayerNorm(nn.Module):
+    def __init__(self, features: int, eps: float = 1e-5, use_kernels: bool = True):
         super().__init__()
-        self.gamma = Tensor.ones((features,), requires_grad=True, name="gamma")
-        self.beta = Tensor.zeros((features,), requires_grad=True, name="beta")
+        self.gamma = nn.Parameter(torch.ones(features))
+        self.beta = nn.Parameter(torch.zeros(features))
         self.eps = eps
+        self.use_kernels = use_kernels
 
-    def forward(self, x: Tensor) -> Tensor:
-        mean = x.mean(axis=-1, keepdims=True)
-        var = ((x - mean) * (x - mean)).mean(axis=-1, keepdims=True)
-        norm = (x - mean) / (var + self.eps).sqrt()
-        return norm * self.gamma + self.beta
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_kernels and not torch.is_grad_enabled() and not x.is_cuda:
+            return cpu_kernels.layernorm_torch(x, self.gamma, self.beta, self.eps)
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        return (x - mean) / torch.sqrt(var + self.eps) * self.gamma + self.beta
 
 
-class MLP(Module):
-    def __init__(self, in_features: int, hidden_features: int, out_features: int, seed: Optional[int] = None):
+class MLP(nn.Module):
+    def __init__(self, in_features: int, hidden_features: int, out_features: int):
         super().__init__()
-        self.fc1 = Linear(in_features, hidden_features, seed=seed)
-        self.fc2 = Linear(hidden_features, out_features, seed=seed)
+        self.fc1 = Linear(in_features, hidden_features)
+        self.fc2 = Linear(hidden_features, out_features)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.fc2(self.fc1(x).relu())
-
-
-class Sequential(Module):
-    def __init__(self, *layers: Module):
-        super().__init__()
-        self.layers = list(layers)
-
-    def forward(self, x: Tensor) -> Tensor:
-        for layer in self.layers:
-            x = layer(x)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.relu(self.fc1(x)))
 
 
-class SelfModifyingLayer(Module):
+class SelfModifyingLayer(nn.Module):
     """Layer with learned update rule for self-modification."""
 
     def __init__(self, features: int, update_hidden: int = 64):
         super().__init__()
         self.base = Linear(features, features)
         self.rule = MLP(features * 2, update_hidden, features)
-        self.scale = Tensor.ones((features,), requires_grad=True, name="selfmod_scale")
+        self.scale = nn.Parameter(torch.ones(features))
         self.base_optimizer = DGD(self.base.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.base(x).relu()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.base(x))
 
-    def self_update(self, x: Tensor, grad: Tensor):
-        context = Tensor(np.concatenate([x.data, grad.data], axis=-1), requires_grad=False)
-        delta = self.rule(context).tanh()
-        target = Tensor(x.data + grad.data, requires_grad=False)
-        pred = self.base(x)
-        loss = ((pred - target) * (pred - target)).mean()
+    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
+        x_detached = x.detach()
+        grad_detached = grad.detach()
+        context = torch.cat([x_detached, grad_detached], dim=-1)
+        delta = torch.tanh(self.rule(context))
+        target = x_detached + grad_detached
+        pred = self.base(x_detached)
+        loss = F.mse_loss(pred, target)
         self.base_optimizer.zero_grad()
         loss.backward()
         self.base_optimizer.step()
-        self.base.weight.data += self.scale.data * delta.data.mean(axis=0)
+        with torch.no_grad():
+            self.base.weight.add_(self.scale * delta.mean(dim=0))
 
 
-class SelfReferentialTitan(Module):
+class SelfReferentialTitan(nn.Module):
     """Self-referential module with an inner optimizer for its update rule."""
 
     def __init__(self, features: int, update_hidden: int = 64, inner_lr: float = 1e-3):
         super().__init__()
         self.core = SelfModifyingLayer(features, update_hidden=update_hidden)
-        self.rule_optimizer = None
-        self.inner_lr = inner_lr
+        self.rule_optimizer = torch.optim.AdamW(self.core.rule.parameters(), lr=inner_lr, weight_decay=1e-4)
 
-    def _init_inner_optimizer(self):
-        if self.rule_optimizer is None:
-            from .optim import AdamW
-            self.rule_optimizer = AdamW(self.core.rule.parameters(), lr=self.inner_lr, weight_decay=1e-4)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.core(x)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.core.forward(x)
-
-    def self_update(self, x: Tensor, grad: Tensor):
-        self.core.self_update(x, grad)
-        self._init_inner_optimizer()
-        target = Tensor(-grad.data, requires_grad=False)
-        context = Tensor(np.concatenate([x.data, grad.data], axis=-1), requires_grad=False)
+    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
+        x_detached = x.detach()
+        grad_detached = grad.detach()
+        self.core.self_update(x_detached, grad_detached)
+        target = -grad_detached
+        context = torch.cat([x_detached, grad_detached], dim=-1)
         pred = self.core.rule(context)
-        loss = ((pred - target) * (pred - target)).mean()
+        loss = F.mse_loss(pred, target)
         self.rule_optimizer.zero_grad()
         loss.backward()
         self.rule_optimizer.step()
 
 
-class SelfModifyingStack(Module):
+class SelfModifyingStack(nn.Module):
     """Stacked self-modifying titans for deeper self-referential updates."""
 
     def __init__(self, features: int, depth: int = 2, update_hidden: int = 64, inner_lr: float = 1e-3):
         super().__init__()
-        self.layers = [SelfReferentialTitan(features, update_hidden=update_hidden, inner_lr=inner_lr) for _ in range(depth)]
+        self.layers = nn.ModuleList(
+            [SelfReferentialTitan(features, update_hidden=update_hidden, inner_lr=inner_lr) for _ in range(depth)]
+        )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
         for layer in self.layers:
-            out = layer(out).relu()
+            out = F.relu(layer(out))
         return out
 
-    def self_update(self, x: Tensor, grad: Tensor):
+    def self_update(self, x: torch.Tensor, grad: torch.Tensor):
         for layer in self.layers:
             layer.self_update(x, grad)
-
-
-class AdaptiveLinear(Module):
-    """Linear layer that supports custom kernel execution."""
-
-    def __init__(self, in_features: int, out_features: int, use_cpu_kernel: bool = True, seed: Optional[int] = None):
-        super().__init__()
-        self.use_cpu_kernel = use_cpu_kernel
-        self.weight = Tensor.randn((in_features, out_features), requires_grad=True, seed=seed, name="weight")
-        self.bias = Tensor.zeros((out_features,), requires_grad=True, name="bias")
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.use_cpu_kernel:
-            out_data = cpu_kernels.matmul(x.data, self.weight.data) + self.bias.data
-            return Tensor(out_data, requires_grad=x.requires_grad or self.weight.requires_grad)
-        out = x @ self.weight
-        return out + self.bias

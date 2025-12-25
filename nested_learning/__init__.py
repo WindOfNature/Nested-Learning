@@ -1,8 +1,8 @@
 """Nested Learning package."""
 
 from .tensor import Tensor
-from .nn import Module, Linear, LayerNorm, MLP, Sequential
-from .optim import SGD, Adam, AdamW, DGD, Muon, ExpressiveOptimizer, ShampooOptimizer
+from .nn import Linear, LayerNorm, MLP, SelfModifyingLayer, SelfReferentialTitan, SelfModifyingStack
+from .torch_optim import DGD
 from .memory import (
     ContinuumMemorySystem,
     NestedContinuumMemorySystem,
@@ -13,18 +13,13 @@ from .hope import HOPEModel
 
 __all__ = [
     "Tensor",
-    "Module",
     "Linear",
     "LayerNorm",
     "MLP",
-    "Sequential",
-    "SGD",
-    "Adam",
-    "AdamW",
+    "SelfModifyingLayer",
+    "SelfReferentialTitan",
+    "SelfModifyingStack",
     "DGD",
-    "Muon",
-    "ExpressiveOptimizer",
-    "ShampooOptimizer",
     "ContinuumMemorySystem",
     "NestedContinuumMemorySystem",
     "SequentialContinuumMemorySystem",

@@ -1,135 +1,146 @@
-"""Continuum Memory System (CMS) implementation."""
+"""Continuum Memory System (CMS) implementation using torch."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List
 
-from .tensor import Tensor, concatenate
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from .nn import Linear, LayerNorm
-from .optim import DGD
+from .torch_optim import DGD
 
 
 @dataclass
 class MemoryState:
     time: int
-    value: Tensor
+    value: torch.Tensor
 
 
-class MemoryBlock:
+class MemoryBlock(nn.Module):
     def __init__(self, features: int, frequency: int, depth: int):
+        super().__init__()
         self.frequency = frequency
-        self.layers = [Linear(features, features) for _ in range(depth)]
+        self.layers = nn.ModuleList([Linear(features, features) for _ in range(depth)])
         self.norm = LayerNorm(features)
-        self.state = MemoryState(time=0, value=Tensor.zeros((1, features)))
+        self.register_buffer("state_value", torch.zeros(1, features))
+        self.state_time = 0
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
-    def parameters(self) -> List[Tensor]:
-        params: List[Tensor] = []
-        for layer in self.layers:
-            params.extend(layer.parameters())
-        params.extend(self.norm.parameters())
-        return params
-
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
         for layer in self.layers:
-            out = layer(out).relu()
+            out = F.relu(layer(out))
         return self.norm(out)
 
-    def update(self, x: Tensor, time: int, update: bool = True):
+    def update(self, x: torch.Tensor, time: int, update: bool = True):
         if not update or time % self.frequency != 0:
             return
-        out = self.forward(x)
-        target = Tensor(x.data, requires_grad=False)
-        loss = ((out - target) * (out - target)).mean()
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        memory_value = out.detach().mean(axis=0, keepdims=True)
-        self.state = MemoryState(time=time, value=memory_value)
+        with torch.enable_grad():
+            x_detached = x.detach()
+            out = self.forward(x_detached)
+            loss = F.mse_loss(out, x_detached)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+        with torch.no_grad():
+            self.state_value.copy_(out.mean(dim=0, keepdim=True))
+            self.state_time = time
+
+    def state(self) -> MemoryState:
+        return MemoryState(time=self.state_time, value=self.state_value)
 
 
-class ContinuumMemorySystem:
+class ContinuumMemorySystem(nn.Module):
     """Multi-timescale memory system as a chain of memory blocks."""
 
     def __init__(self, features: int, frequencies: List[int], depth: int = 2):
-        self.blocks = [MemoryBlock(features, freq, depth) for freq in frequencies]
+        super().__init__()
+        self.blocks = nn.ModuleList([MemoryBlock(features, freq, depth) for freq in frequencies])
         self.features = features
 
-    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
+    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
         context = x
         for block in self.blocks:
             block.update(context, time, update=update)
-            context = context + block.state.value
+            context = context + block.state_value
         return context
 
     def states(self) -> List[MemoryState]:
-        return [block.state for block in self.blocks]
+        return [block.state() for block in self.blocks]
 
 
-class NestedContinuumMemorySystem:
+class NestedContinuumMemorySystem(nn.Module):
     """Fully nested CMS where each block owns a sub-CMS."""
 
     def __init__(self, features: int, frequencies: List[int], depth: int = 2):
-        self.blocks = [MemoryBlock(features, freq, depth) for freq in frequencies]
-        self.subsystems = [ContinuumMemorySystem(features, frequencies[: idx + 1], depth=depth) for idx in range(len(frequencies))]
+        super().__init__()
+        self.blocks = nn.ModuleList([MemoryBlock(features, freq, depth) for freq in frequencies])
+        self.subsystems = nn.ModuleList(
+            [ContinuumMemorySystem(features, frequencies[: idx + 1], depth=depth) for idx in range(len(frequencies))]
+        )
         self.features = features
 
-    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
+    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
         context = x
         for block, sub in zip(self.blocks, self.subsystems):
             block.update(context, time, update=update)
             nested_context = sub.forward(context, time, update=update)
-            context = context + block.state.value + nested_context
+            context = context + block.state_value + nested_context
         return context
 
     def states(self) -> List[MemoryState]:
         states: List[MemoryState] = []
         for block, sub in zip(self.blocks, self.subsystems):
-            states.append(block.state)
+            states.append(block.state())
             states.extend(sub.states())
         return states
 
 
-class SequentialContinuumMemorySystem:
+class SequentialContinuumMemorySystem(nn.Module):
     """Sequential CMS variant with explicit pass-through normalization."""
 
     def __init__(self, features: int, frequencies: List[int], depth: int = 2):
-        self.blocks = [MemoryBlock(features, freq, depth) for freq in frequencies]
+        super().__init__()
+        self.blocks = nn.ModuleList([MemoryBlock(features, freq, depth) for freq in frequencies])
         self.norm = LayerNorm(features)
         self.features = features
 
-    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
+    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
         context = x
         for block in self.blocks:
             block.update(context, time, update=update)
-            context = self.norm(context + block.state.value)
+            context = self.norm(context + block.state_value)
         return context
 
     def states(self) -> List[MemoryState]:
-        return [block.state for block in self.blocks]
+        return [block.state() for block in self.blocks]
 
 
-class HeadwiseContinuumMemorySystem:
+class HeadwiseContinuumMemorySystem(nn.Module):
     """Independent head-wise CMS for parallel memory streams."""
 
     def __init__(self, features: int, frequencies: List[int], heads: int = 4, depth: int = 2):
+        super().__init__()
         if features % heads != 0:
             raise ValueError("features must be divisible by heads")
         self.heads = heads
         self.head_dim = features // heads
-        self.systems = [ContinuumMemorySystem(self.head_dim, frequencies, depth=depth) for _ in range(heads)]
+        self.systems = nn.ModuleList(
+            [ContinuumMemorySystem(self.head_dim, frequencies, depth=depth) for _ in range(heads)]
+        )
         self.features = features
 
-    def forward(self, x: Tensor, time: int, update: bool = True) -> Tensor:
+    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
         chunks = []
         for head in range(self.heads):
             start = head * self.head_dim
             end = start + self.head_dim
-            chunk = x.slice((slice(None), slice(start, end)))
+            chunk = x[:, start:end]
             chunks.append(self.systems[head].forward(chunk, time, update=update))
-        return concatenate(chunks, axis=-1)
+        return torch.cat(chunks, dim=-1)
 
     def states(self) -> List[MemoryState]:
         states: List[MemoryState] = []

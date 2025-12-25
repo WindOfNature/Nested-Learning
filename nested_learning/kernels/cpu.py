@@ -10,11 +10,21 @@ def _numba_available() -> bool:
     return importlib.util.find_spec("numba") is not None
 
 
+def _torch_available() -> bool:
+    return importlib.util.find_spec("torch") is not None
+
+
 if _numba_available():
     from numba import njit, prange
 else:  # pragma: no cover - fallback
     njit = None
     prange = range
+
+
+if _torch_available():
+    import torch
+else:  # pragma: no cover - optional
+    torch = None
 
 
 def _matmul_fallback(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -46,6 +56,15 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return _matmul_fallback(a, b)
 
 
+def matmul_torch(a, b):
+    if torch is None:
+        raise RuntimeError("torch is required for matmul_torch")
+    a_np = a.detach().cpu().numpy()
+    b_np = b.detach().cpu().numpy()
+    out = matmul(a_np, b_np)
+    return torch.from_numpy(out).to(a.device)
+
+
 if njit:
     @njit(parallel=True, fastmath=True)
     def _layernorm_numba(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: float) -> np.ndarray:
@@ -67,3 +86,13 @@ def layernorm(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: float = 1
     mean = x.mean(axis=-1, keepdims=True)
     var = x.var(axis=-1, keepdims=True)
     return (x - mean) / np.sqrt(var + eps) * gamma + beta
+
+
+def layernorm_torch(x, gamma, beta, eps: float = 1e-5):
+    if torch is None:
+        raise RuntimeError("torch is required for layernorm_torch")
+    x_np = x.detach().cpu().numpy()
+    gamma_np = gamma.detach().cpu().numpy()
+    beta_np = beta.detach().cpu().numpy()
+    out = layernorm(x_np, gamma_np, beta_np, eps)
+    return torch.from_numpy(out).to(x.device)
