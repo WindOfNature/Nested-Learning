@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict
 
+import importlib.util
 import numpy as np
 
 
@@ -45,3 +46,8 @@ def register_default_kernels() -> None:
 
 
 register_default_kernels()
+
+if importlib.util.find_spec("triton") is not None:
+    from nestedlearning.triton_kernels import register_triton_kernels
+
+    register_triton_kernels()
