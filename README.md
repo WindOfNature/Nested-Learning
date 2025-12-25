@@ -1,5 +1,5 @@
 # Nested-Learning
-An implementation of HOPE (Self-Mod) architecture from "Nested Learning: The Illusion of Deep Learning Architecture" by Ali Behrouz. This package provides a torch-free nested-learning framework with custom backprop, expressive optimizers, continuum memory systems, and optional Triton GPU kernels.
+An implementation of HOPE (Capable of Self-Modifying and Continual Learning without forgetting) architecture from "Nested Learning: The Illusion of Deep Learning Architecture" by Ali Behrouz. This package provides a torch-free nested-learning framework with custom backprop, expressive optimizers, continuum memory systems, and optional Triton GPU kernels.
 
 ## Features
 - Custom autograd engine with explicit context flow.
@@ -44,7 +44,7 @@ python examples/continual_digits.py --epochs 2 --batch-size 32 --max-samples 500
 This script uses scikit-learn's digits dataset to test self-modification and continual learning with minimal forgetting.
 
 ### Proof of Concept Results
-Recent runs on the digits continual-learning demo show no forgetting, and even a small improvement on Task A after training Task B:
+Recent runs on the digits continual-learning demo show no forgetting, in fact, even a small improvement on Task A after training Task B:
 
 ```
 Task A accuracy before: 0.177
@@ -52,3 +52,4 @@ Task B accuracy: 0.178
 Task A accuracy after: 0.182
 Forgetting: -0.006
 ```
+* (this run is only 200 samples due to Codex enviro limitations)
