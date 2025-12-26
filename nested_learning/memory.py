@@ -126,29 +126,32 @@ class MemoryBlock(nn.Module):
 
             self.optimizer.step(lr_override=eta_val, weight_decay_override=weight_decay)
 
+            # Recompute memory content with updated weights to allow gradient flow
+            # The weights have changed, so we must re-run the forward pass for 'mem'
+            # to attach it to the graph correctly for downstream tasks.
+            mem_new = x
+            for layer in self.layers:
+                mem_new = F.relu(layer(mem_new))
+            mem_new = self.norm(mem_new)
+
+            # Use new memory content
+            mem = mem_new
+
         # Update replay buffer (detached)
         if self.replay_ratio > 0.0:
              # Store samples, not batches
              self.replay_buffer.extend(x.detach().unbind(0))
 
-        # Return output with detached memory content to avoid in-place error during backprop
-        # because 'layers' (used to compute mem) were updated in-place.
-        # But we keep 'eta_tensor' attached so it can learn via Task Loss.
-        out_detached = x + eta_tensor * mem.detach()
+        # Return attached output for end-to-end learning
+        out_final = x + eta_tensor * mem
 
-        # We also need to fix new_hidden if it depends on mem
         # Fix Hidden State Detachment:
-        # The new hidden state must be detached from the optimization graph of the current step
-        # to prevent backprop through time from overwriting previous stable states (Online Learning).
         if self.decay > 0.0:
-            new_hidden = (1.0 - self.decay) * hidden_state + self.decay * mem.detach()
+            new_hidden = (1.0 - self.decay) * hidden_state + self.decay * mem
         else:
-            new_hidden = mem.detach()
+            new_hidden = mem
 
-        # Detach explicitly for safety (though mem.detach() handles most of it)
-        new_hidden_detached = new_hidden.detach()
-
-        return out_detached, new_hidden_detached
+        return out_final, new_hidden.detach()
 
     def state(self) -> MemoryState:
         # Placeholder as state is now external

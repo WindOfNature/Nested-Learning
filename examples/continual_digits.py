@@ -49,12 +49,32 @@ def train_task(
             batch_idx = indices[step : step + batch_size]
             batch_x = torch.tensor(x[batch_idx], device=device)
             batch_y = torch.tensor(y[batch_idx], device=device)
-            logits = model.forward(batch_x, time=global_step)
-            loss = torch.nn.functional.cross_entropy(logits, batch_y)
+
+            # 1. Remember new data
+            model.remember(batch_x, batch_y)
+
+            # 2. Sample Replay
+            replay_data = model.sample_replay(batch_size // 2)
+
+            # 3. Mix
+            if replay_data is not None:
+                rx, ry = replay_data
+                combined_x = torch.cat([batch_x, rx], dim=0)
+                combined_y = torch.cat([batch_y, ry], dim=0)
+            else:
+                combined_x = batch_x
+                combined_y = batch_y
+
+            # 4. Train on Combined Batch (Encoder, Decoder, Memory all learn from mixed)
+            logits = model.forward(combined_x, time=global_step)
+            loss = torch.nn.functional.cross_entropy(logits, combined_y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            chunk_buffer.append(batch_x)
+
+            # 5. Update Chunk (CMS Maintenance on Mixed Data)
+            # We use the combined batch for chunk updates to ensure consistency
+            chunk_buffer.append(combined_x)
             if (step // batch_size + 1) % chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
                 model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)

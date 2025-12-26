@@ -122,6 +122,25 @@ class HOPEModel(nn.Module):
         self._last_context: torch.Tensor | None = None
         self._last_logits: torch.Tensor | None = None
 
+    def remember(self, x: torch.Tensor, y: torch.Tensor):
+        # Store raw experience as tuples (x, y)
+        x_detached = x.detach().cpu()
+        y_detached = y.detach().cpu()
+        for i in range(x.size(0)):
+            self.raw_replay_buffer.append((x_detached[i], y_detached[i]))
+
+    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if len(self.raw_replay_buffer) < batch_size:
+            return None
+        import random
+        samples = random.sample(self.raw_replay_buffer, batch_size)
+        x_list, y_list = zip(*samples)
+        # Move to device of current parameters
+        device = self.decoder.weight.device
+        x_batch = torch.stack(x_list).to(device)
+        y_batch = torch.stack(y_list).to(device)
+        return x_batch, y_batch
+
     def forward(self, x: torch.Tensor, time: int, update_memory: bool = True) -> torch.Tensor:
         encoded = F.relu(self.encoder(x))
         if self.pre_norm is not None:
@@ -208,23 +227,10 @@ class HOPEModel(nn.Module):
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
 
-        # Step A: Store raw experience (detached from graph)
-        # Assuming x is raw input
-        self.raw_replay_buffer.extend(x.detach().unbind(0))
+        # Replay mixing is handled externally now.
+        # update_chunk simply processes the provided input x (which is already mixed).
 
-        x_combined = x
-
-        # Step B & C: Sample and Mix
-        if self.replay_ratio > 0.0 and len(self.raw_replay_buffer) > 0:
-            replay_count = max(1, int(self.replay_ratio * x.size(0)))
-            if len(self.raw_replay_buffer) >= replay_count:
-                import random
-                replay_samples = random.sample(self.raw_replay_buffer, replay_count)
-                replay_batch = torch.stack(replay_samples, dim=0)
-                x_combined = torch.cat([x, replay_batch], dim=0)
-
-        # Step D: Encode Combined Batch
-        encoded = F.relu(self.encoder(x_combined))
+        encoded = F.relu(self.encoder(x))
         if self.pre_norm is not None:
             encoded = self.pre_norm(encoded)
         if self.conv is not None:
