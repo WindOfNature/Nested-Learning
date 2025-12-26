@@ -1,7 +1,7 @@
 # Nested Learning
 
 An unofficial implementation of **Nested Learning (NL)** and **HOPE** from
-*"Nested Learning: The Illusion of Deep Learning Architecture"* (Behrouz et al.).
+*"Nested Learning: The Illusion of Deep Learning Architecture"* (Ali Behrouz et al, and other Google Researcher).
 This repository provides self-referential Titans, nested context-flow, a Continuum
 Memory System (CMS), expressive optimizers, and optimized CPU/GPU kernels.
 
@@ -9,7 +9,7 @@ Memory System (CMS), expressive optimizers, and optimized CPU/GPU kernels.
 
 ## Disclaimer
 This codebase was generated with assistance from OpenAI Codex (GPT-5.2-Codex-Max)
-and may contain inaccuracies relative to the paper. Issues and PRs are welcome.
+and may contain inaccuracies/imcomplete relative to the paper. Issues and PRs are greatly welcome to improve this framework further 😁.
 
 ---
 
