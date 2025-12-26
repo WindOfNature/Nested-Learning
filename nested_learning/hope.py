@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, List
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,81 @@ class HopeState:
 
 
 class HOPEModel(nn.Module):
+    @staticmethod
+    def preset_config(preset: str) -> dict[str, Any]:
+        if preset == "fast_adapt":
+            return {
+                "hope_levels": 3,
+                "lowest_frequency": 1,
+                "memory_decay": 0.015,
+                "replay_ratio": 0.35,
+                "replay_steps": 1,
+                "self_mod_depth": 4,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        if preset == "high_retention":
+            return {
+                "hope_levels": 4,
+                "lowest_frequency": 1,
+                "memory_decay": 0.01,
+                "replay_ratio": 0.5,
+                "replay_steps": 2,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        if preset == "balanced":
+            return {
+                "hope_levels": 3,
+                "lowest_frequency": 1,
+                "memory_decay": 0.01,
+                "replay_ratio": 0.4,
+                "replay_steps": 1,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        raise ValueError(f"Unknown preset: {preset}")
+
+    @staticmethod
+    def auto_scale_config(dataset_size: int | None, task_count: int | None) -> dict[str, Any]:
+        if not dataset_size or not task_count:
+            return {}
+        replay_buffer = int(min(20000, max(512, dataset_size * task_count)))
+        replay_ratio = min(0.65, 0.2 + 0.1 * task_count)
+        memory_decay = min(0.05, 0.005 + 0.003 * math.log2(task_count + 1))
+        return {
+            "replay_buffer": replay_buffer,
+            "replay_ratio": replay_ratio,
+            "memory_decay": memory_decay,
+        }
+
+    @classmethod
+    def from_preset(
+        cls,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        *,
+        preset: str = "balanced",
+        dataset_size: int | None = None,
+        task_count: int | None = None,
+        auto_scale: bool = True,
+        **overrides: Any,
+    ) -> "HOPEModel":
+        config = cls.preset_config(preset)
+        if auto_scale:
+            config.update(cls.auto_scale_config(dataset_size, task_count))
+        config.update(overrides)
+        return cls(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            task_count=task_count,
+            **config,
+        )
+
     def __init__(
         self,
         input_dim: int,

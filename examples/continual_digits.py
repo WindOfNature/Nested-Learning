@@ -27,6 +27,32 @@ def prepare_tasks():
     return task_a, task_b
 
 
+def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) -> argparse.Namespace:
+    if args.preset != "custom":
+        preset_config = HOPEModel.preset_config(args.preset)
+        args.hope_levels = preset_config["hope_levels"]
+        args.lowest_frequency = preset_config["lowest_frequency"]
+        args.memory_decay = preset_config["memory_decay"]
+        args.replay_ratio = preset_config["replay_ratio"]
+        args.replay_steps = preset_config["replay_steps"]
+        args.self_mod_depth = preset_config["self_mod_depth"]
+        args.nested_depth = preset_config["nested_depth"]
+        args.nested_hidden = preset_config["nested_hidden"]
+
+    if args.auto_scale:
+        auto_config = HOPEModel.auto_scale_config(dataset_size, task_count)
+        args.replay_buffer = auto_config.get("replay_buffer", args.replay_buffer)
+        args.replay_ratio = auto_config.get("replay_ratio", args.replay_ratio)
+        args.memory_decay = auto_config.get("memory_decay", args.memory_decay)
+        args.chunk_size = max(2, int(np.sqrt(dataset_size) // 8))
+        args.memory_chunk_size = max(args.chunk_size, int(np.sqrt(dataset_size) // 6))
+        args.replay_weight = min(0.3, 0.05 + 0.02 * task_count)
+        if args.task_b_epochs is None:
+            args.task_b_epochs = max(args.epochs, 10)
+
+    return args
+
+
 def train_task(
     model: HOPEModel,
     optimizer: torch.optim.Optimizer,
@@ -125,13 +151,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--task-a-epochs", type=int, default=None)
-    parser.add_argument("--task-b-epochs", type=int, default=10)
+    parser.add_argument("--task-b-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--chunk-size", type=int, default=4)
     parser.add_argument("--memory-chunk-size", type=int, default=4)
+    parser.add_argument("--preset", type=str, default="balanced", choices=["balanced", "fast_adapt", "high_retention", "custom"])
+    parser.add_argument("--auto-scale", dest="auto_scale", action="store_true", default=True)
+    parser.add_argument("--no-auto-scale", dest="auto_scale", action="store_false")
     parser.add_argument("--cms-variant", type=str, default="nested", choices=["nested", "sequential", "headwise", "chain"])
     parser.add_argument("--nested-depth", type=int, default=2)
     parser.add_argument("--nested-hidden", type=int, default=128)
@@ -166,6 +195,7 @@ def main():
     xb_train, xb_test, yb_train, yb_test = train_test_split(xb, yb, test_size=0.2, random_state=42)
     xa_train, ya_train = xa_train[: args.max_samples], ya_train[: args.max_samples]
     xb_train, yb_train = xb_train[: args.max_samples], yb_train[: args.max_samples]
+    total_train = len(xa_train) + len(xb_train)
 
     projection_mask = (
         not args.freeze_k,
@@ -175,27 +205,47 @@ def main():
         not args.freeze_alpha,
     )
 
-    model = HOPEModel(
-        input_dim=64,
-        hidden_dim=128,
-        output_dim=5,
-        task_count=2,
-        frequencies=None if args.hope_levels else [1, 2, 4, 8],
-        cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
-        self_mod_depth=args.self_mod_depth,
-        heads=4,
-        nested_depth=args.nested_depth,
-        nested_hidden=args.nested_hidden,
-        memory_decay=args.memory_decay,
-        replay_ratio=args.replay_ratio,
-        replay_steps=args.replay_steps,
-        replay_buffer=args.replay_buffer,
-        self_mod_query_static=args.self_mod_query_static,
-        self_mod_projection_mask=projection_mask,
-        backbone=args.backbone,
-        hope_levels=args.hope_levels or None,
-        lowest_frequency=args.lowest_frequency,
-    ).to(device)
+    args = apply_presets(args, dataset_size=total_train, task_count=2)
+
+    if args.preset != "custom":
+        model = HOPEModel.from_preset(
+            input_dim=64,
+            hidden_dim=128,
+            output_dim=5,
+            preset=args.preset,
+            dataset_size=total_train,
+            task_count=2,
+            auto_scale=args.auto_scale,
+            cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
+            replay_steps=args.replay_steps,
+            replay_buffer=args.replay_buffer,
+            self_mod_query_static=args.self_mod_query_static,
+            self_mod_projection_mask=projection_mask,
+            backbone=args.backbone,
+            heads=4,
+        ).to(device)
+    else:
+        model = HOPEModel(
+            input_dim=64,
+            hidden_dim=128,
+            output_dim=5,
+            task_count=2,
+            frequencies=None if args.hope_levels else [1, 2, 4, 8],
+            cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
+            self_mod_depth=args.self_mod_depth,
+            heads=4,
+            nested_depth=args.nested_depth,
+            nested_hidden=args.nested_hidden,
+            memory_decay=args.memory_decay,
+            replay_ratio=args.replay_ratio,
+            replay_steps=args.replay_steps,
+            replay_buffer=args.replay_buffer,
+            self_mod_query_static=args.self_mod_query_static,
+            self_mod_projection_mask=projection_mask,
+            backbone=args.backbone,
+            hope_levels=args.hope_levels or None,
+            lowest_frequency=args.lowest_frequency,
+        ).to(device)
     base_optimizer = torch.optim.AdamW
     if args.steered_optim:
         config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)

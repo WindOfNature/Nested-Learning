@@ -54,22 +54,19 @@ are automatically used during inference when gradients are disabled.
 
 ## Quickstarts
 
-### A) HOPE (Titans backbone)
+### A) HOPE (Titans backbone, preset defaults)
 
 ```python
 import torch
 from nested_learning.hope import HOPEModel
 
-model = HOPEModel(
+model = HOPEModel.from_preset(
     input_dim=64,
     hidden_dim=128,
     output_dim=10,
-    frequencies=[1, 4, 16],
-    cms_variant="nested",
-    self_mod_depth=3,
-    nested_depth=2,
-    memory_decay=0.1,
-    replay_ratio=0.2,
+    preset="balanced",
+    dataset_size=10_000,
+    task_count=4,
     backbone="titans",
 )
 
@@ -77,18 +74,19 @@ x = torch.randn(8, 64)
 logits = model(x, time=0)
 ```
 
-### B) Hope-Attention
+### B) Hope-Attention (preset defaults)
 
 ```python
 import torch
 from nested_learning.hope import HOPEModel
 
-model = HOPEModel(
+model = HOPEModel.from_preset(
     input_dim=64,
     hidden_dim=128,
     output_dim=10,
-    frequencies=[1, 4, 16],
-    cms_variant="nested",
+    preset="balanced",
+    dataset_size=10_000,
+    task_count=4,
     backbone="attention",
 )
 
@@ -100,13 +98,7 @@ logits = model(x, time=0)
 
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
-  --epochs 2 \
-  --batch-size 32 \
-  --max-samples 500 \
-  --chunk-size 4 \
-  --memory-chunk-size 8 \
-  --steered-optim \
-  --precondition outer
+  --max-samples 500
 ```
 
 ### D) CMS multi-level frequencies
@@ -185,6 +177,7 @@ HOPEModel(
     input_dim: int,
     hidden_dim: int,
     output_dim: int,
+    task_count: int | None = None,
     frequencies: list[int] | None,
     cms_variant: str = "nested",  # nested | sequential | headwise | chain
     self_mod_depth: int = 2,
@@ -207,10 +200,34 @@ HOPEModel(
 )
 ```
 
-- `forward(x, time, update_memory=True)`
-- `update_chunk(x, chunk_size=None, memory_chunk_size=None)`
+- `forward(x, time, update_memory=True, task_id=None, detach_encoder=False)`
+- `update_chunk(x, chunk_size=None, memory_chunk_size=None, task_id=None)`
 - `self_update_from_logits()`
 
+### `HOPEModel.from_preset`
+
+```python
+HOPEModel.from_preset(
+    input_dim: int,
+    hidden_dim: int,
+    output_dim: int,
+    preset: str = "balanced",  # balanced | fast_adapt | high_retention
+    dataset_size: int | None = None,
+    task_count: int | None = None,
+    auto_scale: bool = True,
+    **overrides,
+)
+```
+
+The preset path reduces the number of knobs for most users. Advanced overrides
+(e.g., `frequencies`, `replay_ratio`, `self_mod_depth`) are still available but
+not required for a solid baseline.
+
+### Presets & Auto-scale (recommended)
+
+If you don’t want to tune hyperparameters, use `preset="balanced"` with
+`auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, and
+memory decay based on dataset size and task count.
 ---
 
 ## Optimizer State Persistence (Continual Learning)
@@ -229,13 +246,12 @@ load_optimizer_state(optimizer, "optim_state.pt")
 Example run (as in the paper’s continual-learning style setup):
 
 ```
-Task A accuracy before: 0.287
-Task B accuracy: 0.228
-Task A accuracy after: 0.287
-Forgetting: 0.000
+Task A accuracy before: 0.652
+Task B accuracy: 0.922
+Task A accuracy after: 0.873
+Forgetting: -0.221
 ```
-* Accuracy is low because HOPE is not designed for vision task and this current implementation only uses a 128 dim, no CNN
-* and this was ran on only 200 max samples.
+* Accuracy is shown for the default preset + auto-scale settings using 500 max samples.
 ---
 
 ## Package Layout
