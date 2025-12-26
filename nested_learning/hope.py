@@ -16,6 +16,7 @@ from .memory import (
     NestedContinuumMemorySystem,
     SequentialContinuumMemorySystem,
     HeadwiseContinuumMemorySystem,
+    MemoryBlock,
 )
 
 
@@ -23,6 +24,7 @@ from .memory import (
 class HopeState:
     time: int
     memory: List[Any] | None  # Supports nested list of states
+    decoder_memory: Any | None = None
 
 
 class HOPEModel(nn.Module):
@@ -111,9 +113,17 @@ class HOPEModel(nn.Module):
             else None
         )
         self.attention = AttentionBlock(hidden_dim, heads=heads) if backbone == "attention" else None
+        # Memory-Augmented Decoder to protect mapping
+        self.decoder_mem = MemoryBlock(
+            hidden_dim,
+            frequency=1,
+            depth=1,
+            replay_ratio=replay_ratio,
+            replay_buffer=replay_buffer
+        )
         self.decoder = Linear(hidden_dim, output_dim)
         self.norm = LayerNorm(hidden_dim)
-        self.state = HopeState(time=0, memory=None)
+        self.state = HopeState(time=0, memory=None, decoder_memory=None)
 
         self.replay_ratio = replay_ratio
         self.replay_steps = replay_steps
@@ -196,7 +206,18 @@ class HOPEModel(nn.Module):
         normed = self.norm(modulated)
         if self.post_norm is not None:
             normed = self.post_norm(normed)
-        logits = self.decoder(normed)
+
+        # Update Decoder Memory
+        dec_state = self.state.decoder_memory
+        # Check dim
+        if dec_state is not None and dec_state.size(0) != normed.size(0):
+            dec_state = None
+        if dec_state is None:
+            dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
+
+        normed_mem, new_dec_state = self.decoder_mem.update(normed, dec_state, update=update_memory)
+
+        logits = self.decoder(normed_mem)
         if update_memory:
             # We detach states to prevent infinite graph growth across steps,
             # but for BPTT within a window we might want to keep it?
@@ -211,7 +232,11 @@ class HOPEModel(nn.Module):
             # But we store it in self.state.
             # I will detach here to be safe for infinite loops, but return/keep graph if needed?
             # self.state is used for next step.
-            self.state = HopeState(time=time, memory=[s.detach() if isinstance(s, torch.Tensor) else s for s in new_cms_states])
+            self.state = HopeState(
+                time=time,
+                memory=[s.detach() if isinstance(s, torch.Tensor) else s for s in new_cms_states],
+                decoder_memory=new_dec_state.detach()
+            )
             self._last_context = memory_context
             logits.retain_grad()
             self._last_logits = logits
@@ -254,6 +279,20 @@ class HOPEModel(nn.Module):
                 projection_mask=self.self_mod_projection_mask,
             )
 
+        # Update Decoder Memory in chunk
+        if self.self_mod is not None:
+             modulated = self.self_mod(encoded)
+        else:
+             modulated = encoded
+
+        normed = self.norm(modulated)
+        if self.post_norm is not None:
+            normed = self.post_norm(normed)
+
+        # Reset state for chunk update
+        dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
+        self.decoder_mem.update(normed, dec_state, update=True)
+
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:
             return
@@ -261,7 +300,7 @@ class HOPEModel(nn.Module):
         self.self_mod.update_chunk(self._last_context + grad_hidden)
 
     def reset(self):
-        self.state = HopeState(time=0, memory=None)
+        self.state = HopeState(time=0, memory=None, decoder_memory=None)
         # Clear CMS internal buffers if any (e.g. state_value in blocks was removed, but what about others?)
         # Step counter?
         # Iterate through blocks and reset buffers?
@@ -275,3 +314,5 @@ class HOPEModel(nn.Module):
              for sys in self.cms.systems:
                   for block in sys.blocks:
                        block.step_counter = 0
+        if hasattr(self, "decoder_mem"):
+             self.decoder_mem.step_counter = 0

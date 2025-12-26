@@ -101,7 +101,7 @@ def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int, de
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
@@ -112,7 +112,7 @@ def main():
     parser.add_argument("--nested-depth", type=int, default=2)
     parser.add_argument("--nested-hidden", type=int, default=128)
     parser.add_argument("--memory-decay", type=float, default=0.01)
-    parser.add_argument("--replay-ratio", type=float, default=0.25)
+    parser.add_argument("--replay-ratio", type=float, default=0.5)
     parser.add_argument("--replay-steps", type=int, default=1)
     parser.add_argument("--replay-buffer", type=int, default=2000)
     parser.add_argument("--self-mod-depth", type=int, default=3)

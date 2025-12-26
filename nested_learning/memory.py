@@ -50,10 +50,11 @@ class MemoryBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Memory content generation (MLP)
-        mem = x
+        # Apply normalization to input, but remove from output to allow magnitude growth
+        mem = self.norm(x)
         for layer in self.layers:
             mem = F.relu(layer(mem))
-        mem = self.norm(mem)
+        # No output normalization
 
         # Meta-learning signals
         eta = torch.sigmoid(self.meta(x)) * 0.1
@@ -90,10 +91,10 @@ class MemoryBlock(nn.Module):
 
             x_det = x.detach()
             # Recompute mem with detached input
-            mem_local = x_det
+            mem_local = self.norm(x_det)
             for layer in self.layers:
                 mem_local = F.relu(layer(mem_local))
-            mem_local = self.norm(mem_local)
+            # No output norm
 
             # Reconstruct out locally
             out_local = x_det + eta_tensor.detach() * mem_local
@@ -122,17 +123,19 @@ class MemoryBlock(nn.Module):
             alpha_val = alpha_tensor.mean().item()
 
             # Fix retention logic: decay = (1.0 - alpha) * scale
-            weight_decay = (1.0 - alpha_val) * 1e-4
+            # Hard Retention: Lock neurons if alpha > 0.9
+            mask = 1.0 if alpha_val > 0.9 else 0.0
+            weight_decay = (1.0 - alpha_val) * 1e-4 * (1.0 - mask)
 
             self.optimizer.step(lr_override=eta_val, weight_decay_override=weight_decay)
 
             # Recompute memory content with updated weights to allow gradient flow
             # The weights have changed, so we must re-run the forward pass for 'mem'
             # to attach it to the graph correctly for downstream tasks.
-            mem_new = x
+            mem_new = self.norm(x)
             for layer in self.layers:
                 mem_new = F.relu(layer(mem_new))
-            mem_new = self.norm(mem_new)
+            # No output norm
 
             # Use new memory content
             mem = mem_new
