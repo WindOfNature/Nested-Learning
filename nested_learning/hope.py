@@ -101,48 +101,57 @@ class HOPEModel(nn.Module):
                 "cms_memory_chunk_size": 16,
             }
 
-        steps_per_task = max(1, dataset_size // task_count)
+        steps_per_task = max(1, math.ceil(dataset_size / task_count))
         if batch_size:
-            steps_per_task = max(1, steps_per_task // batch_size)
+            steps_per_task = max(1, math.ceil(steps_per_task / batch_size))
 
         if steps_per_task <= 32:
             return {
-                "frequencies": [1, 2, 4, 8],
+                "frequencies": [1, 4, 8, 16],
                 "cms_depth": 2,
                 "cms_chunk_size": 4,
                 "cms_memory_chunk_size": 4,
             }
 
-        base_freq = max(8, int(round(steps_per_task * 4)))
-        max_freq = min(2048, 2 ** int(round(math.log2(base_freq))))
+        def snap_pow2(value: float, minimum: int = 1) -> int:
+            return max(minimum, int(2 ** round(math.log2(max(value, 1)))))
+
+        scale = 2 + task_count
+        base_min = 64 if task_count <= 1 else 128
+        slowest_target = max(base_min, int(round(steps_per_task * scale)))
+        if dataset_size >= 10000 or task_count >= 4:
+            slowest_target = max(slowest_target, 512)
+        if dataset_size >= 50000 or task_count >= 8:
+            slowest_target = max(slowest_target, 2048)
+        slowest_chunk = min(8192, snap_pow2(slowest_target, minimum=4))
 
         level_count = 2
-        if task_count >= 2 or dataset_size >= 1024:
-            level_count = 3
-        if task_count >= 4 or dataset_size >= 20000:
+        if task_count >= 2 or dataset_size >= 512:
             level_count = 4
 
         if level_count == 1:
             frequencies = [1]
         else:
-            log_span = max(1.0, math.log2(max_freq))
+            log_span = math.log2(slowest_chunk)
             frequencies = []
             for idx in range(level_count):
                 exp = idx * log_span / (level_count - 1)
-                freq = int(2 ** round(exp))
+                freq = snap_pow2(2 ** exp)
+                freq = min(slowest_chunk, freq)
                 if frequencies and freq <= frequencies[-1]:
-                    freq = min(max_freq, frequencies[-1] * 2)
-                frequencies.append(max(1, freq))
+                    freq = min(slowest_chunk, frequencies[-1] * 2)
+                frequencies.append(freq)
+            frequencies[-1] = slowest_chunk
 
         cms_depth = 2
-        if dataset_size >= 5000 or task_count >= 4:
+        if task_count >= 2 or dataset_size >= 512:
             cms_depth = 3
-        if dataset_size >= 50000:
+        if dataset_size >= 20000 or task_count >= 4:
             cms_depth = 4
 
-        chunk_base = max(8, int(round(steps_per_task)))
-        cms_chunk_size = min(128, max(4, chunk_base))
-        cms_memory_chunk_size = min(256, max(cms_chunk_size, int(cms_chunk_size * 2)))
+        chunk_base = max(4, min(16, slowest_chunk // 16))
+        cms_chunk_size = max(4, min(32, chunk_base))
+        cms_memory_chunk_size = max(cms_chunk_size, min(64, cms_chunk_size * 2))
 
         return {
             "frequencies": frequencies,
