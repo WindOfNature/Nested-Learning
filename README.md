@@ -1,6 +1,6 @@
 # Nested Learning
 
-A production-grade implementation of **Nested Learning (NL)** and **HOPE** from
+An unofficial implementation of **Nested Learning (NL)** and **HOPE** from
 *"Nested Learning: The Illusion of Deep Learning Architecture"* (Behrouz et al.).
 This repository provides self-referential Titans, nested context-flow, a Continuum
 Memory System (CMS), expressive optimizers, and optimized CPU/GPU kernels.
