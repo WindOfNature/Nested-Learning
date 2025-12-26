@@ -173,34 +173,44 @@ class HOPEModel(nn.Module):
         for i in range(x.size(0)):
             self.raw_replay_buffer[buffer_key].append((x_detached[i], y_detached[i]))
 
-    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         if not self.raw_replay_buffer:
             return None
         total_samples = sum(len(buf) for buf in self.raw_replay_buffer.values())
         if total_samples < batch_size:
             return None
         import random
-        buffers = list(self.raw_replay_buffer.values())
+        buffers = list(self.raw_replay_buffer.items())
         per_task = max(1, batch_size // len(buffers))
-        samples: list[tuple[torch.Tensor, torch.Tensor]] = []
-        for buf in buffers:
+        samples: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+        for task_key, buf in buffers:
             if not buf:
                 continue
             take = min(per_task, len(buf))
-            samples.extend(random.sample(buf, take))
+            samples.extend((task_key, x, y) for x, y in random.sample(buf, take))
         remaining = batch_size - len(samples)
         if remaining > 0:
-            flat_buffer = [item for buf in buffers for item in buf]
+            flat_buffer = [(task_key, x, y) for task_key, buf in buffers for x, y in buf]
             samples.extend(random.sample(flat_buffer, remaining))
-        x_list, y_list = zip(*samples)
+        task_ids, x_list, y_list = zip(*samples)
         # Move to device of current parameters
         device = next(self.parameters()).device
         x_batch = torch.stack(x_list).to(device)
         y_batch = torch.stack(y_list).to(device)
-        return x_batch, y_batch
+        task_batch = torch.tensor(task_ids, device=device, dtype=torch.long)
+        return x_batch, y_batch, task_batch
 
-    def forward(self, x: torch.Tensor, time: int, update_memory: bool = True, task_id: int | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        time: int,
+        update_memory: bool = True,
+        task_id: int | None = None,
+        detach_encoder: bool = False,
+    ) -> torch.Tensor:
         encoded = F.relu(self.encoder(x))
+        if detach_encoder:
+            encoded = encoded.detach()
         if self.pre_norm is not None:
             encoded = self.pre_norm(encoded)
         if self.conv is not None:

@@ -39,6 +39,7 @@ def train_task(
     chunk_size: int,
     memory_chunk_size: int,
     task_id: int,
+    replay_weight: float,
 ):
     model.train()
     global_step = 0
@@ -57,18 +58,30 @@ def train_task(
             # 2. Sample Replay
             replay_data = model.sample_replay(batch_size // 2)
 
-            # 3. Mix
+            # 3. Train with task-weighted replay
             if replay_data is not None:
-                rx, ry = replay_data
+                rx, ry, rtask = replay_data
+                logits_current = model.forward(batch_x, time=global_step, task_id=task_id)
+                loss_current = torch.nn.functional.cross_entropy(logits_current, batch_y)
+                loss_replay = 0.0
+                for task_value in torch.unique(rtask):
+                    mask = rtask == task_value
+                    if not mask.any():
+                        continue
+                    logits_replay = model.forward(
+                        rx[mask],
+                        time=global_step,
+                        task_id=int(task_value.item()),
+                        update_memory=False,
+                        detach_encoder=True,
+                    )
+                    loss_replay = loss_replay + torch.nn.functional.cross_entropy(logits_replay, ry[mask])
+                loss = loss_current + replay_weight * loss_replay
                 combined_x = torch.cat([batch_x, rx], dim=0)
-                combined_y = torch.cat([batch_y, ry], dim=0)
             else:
+                logits = model.forward(batch_x, time=global_step, task_id=task_id)
+                loss = torch.nn.functional.cross_entropy(logits, batch_y)
                 combined_x = batch_x
-                combined_y = batch_y
-
-            # 4. Train on Combined Batch (Encoder, Decoder, Memory all learn from mixed)
-            logits = model.forward(combined_x, time=global_step, task_id=task_id)
-            loss = torch.nn.functional.cross_entropy(logits, combined_y)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -110,7 +123,9 @@ def evaluate(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--task-a-epochs", type=int, default=None)
+    parser.add_argument("--task-b-epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
@@ -124,6 +139,7 @@ def main():
     parser.add_argument("--replay-ratio", type=float, default=0.5)
     parser.add_argument("--replay-steps", type=int, default=1)
     parser.add_argument("--replay-buffer", type=int, default=2000)
+    parser.add_argument("--replay-weight", type=float, default=0.1)
     parser.add_argument("--self-mod-depth", type=int, default=3)
     parser.add_argument("--self-mod-query-static", action="store_true")
     parser.add_argument("--backbone", type=str, default="titans", choices=["titans", "attention"])
@@ -187,18 +203,22 @@ def main():
     else:
         optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
 
+    task_a_epochs = args.task_a_epochs if args.task_a_epochs is not None else args.epochs
+    task_b_epochs = args.task_b_epochs if args.task_b_epochs is not None else args.epochs
+
     train_task(
         model,
         optimizer,
         xa_train,
         ya_train,
-        epochs=args.epochs,
+        epochs=task_a_epochs,
         batch_size=args.batch_size,
         device=device,
         rng=rng,
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
         task_id=0,
+        replay_weight=args.replay_weight,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
@@ -219,13 +239,14 @@ def main():
         optimizer,
         xb_train,
         yb_train,
-        epochs=args.epochs,
+        epochs=task_b_epochs,
         batch_size=args.batch_size,
         device=device,
         rng=rng,
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
         task_id=1,
+        replay_weight=args.replay_weight,
     )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
