@@ -1,6 +1,9 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
+
 from nested_learning.hope import HOPEModel
+from nested_learning.nn import SelfReferentialTitan
 
 def debug_hooks():
     model = HOPEModel(
@@ -27,6 +30,49 @@ def debug_hooks():
                     print(f"[{name}] Mem Mean={mem.mean().item():.4f} Std={mem.std().item():.4f}")
 
         return hook
+
+    def log_titan_signals(name, layer: SelfReferentialTitan, context: torch.Tensor):
+        with torch.no_grad():
+            x_ln = layer.norm(context)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
+            signals = layer.generate_signals(x_l2)
+            print(
+                f"[{name}] eta={signals.eta.mean().item():.4f} "
+                f"alpha={signals.alpha.mean().item():.4f} "
+                f"q={signals.q.norm(dim=-1).mean().item():.4f} "
+                f"k={signals.k.norm(dim=-1).mean().item():.4f} "
+                f"v={signals.v.norm(dim=-1).mean().item():.4f} "
+                f"mem={signals.memory.norm(dim=-1).mean().item():.4f}"
+            )
+
+    def snapshot_titan_params(layer: SelfReferentialTitan):
+        params = {}
+        for name, module in [
+            ("mk", layer.mk),
+            ("mv", layer.mv),
+            ("mq", layer.mq),
+            ("meta", layer.meta),
+            ("malpha", layer.malpha),
+            ("mmemory", layer.mmemory),
+        ]:
+            params[name] = [p.detach().clone() for p in module.parameters()]
+        return params
+
+    def delta_norms(before, layer: SelfReferentialTitan):
+        deltas = {}
+        for name, module in [
+            ("mk", layer.mk),
+            ("mv", layer.mv),
+            ("mq", layer.mq),
+            ("meta", layer.meta),
+            ("malpha", layer.malpha),
+            ("mmemory", layer.mmemory),
+        ]:
+            total = 0.0
+            for idx, p in enumerate(module.parameters()):
+                total += (p.detach() - before[name][idx]).norm().item()
+            deltas[name] = total
+        return deltas
 
     # Attach to first memory block
     if hasattr(model.cms, 'blocks'):
@@ -60,6 +106,22 @@ def debug_hooks():
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        if model._last_context is not None and model._last_context.grad is not None:
+            grad_norm = model._last_context.grad.norm(dim=-1).mean().item()
+            print(f"[LossGrad] Context grad mean norm={grad_norm:.4f}")
+
+        if model.self_mod is not None and model._last_context is not None:
+            for idx, layer in enumerate(model.self_mod.layers):
+                log_titan_signals(f"Titans_{idx}", layer, model._last_context.detach())
+
+            before = [snapshot_titan_params(layer) for layer in model.self_mod.layers]
+            model.self_update_from_logits()
+            for idx, layer in enumerate(model.self_mod.layers):
+                deltas = delta_norms(before[idx], layer)
+                delta_str = " ".join([f"{name}={value:.4f}" for name, value in deltas.items()])
+                print(f"[Titans_{idx}] update_deltas {delta_str}")
+
         optimizer.step()
 
         model.update_chunk(x)

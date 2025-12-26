@@ -458,6 +458,8 @@ class HOPEModel(nn.Module):
         # Apply Final Norm before Linear Decoder
         logits = decoder(self.final_norm(normed_mem))
         if update_memory:
+            if encoded.requires_grad:
+                encoded.retain_grad()
             # We detach states to prevent infinite graph growth across steps,
             # but for BPTT within a window we might want to keep it?
             # Standard RNN practice is detach between batches.
@@ -550,13 +552,17 @@ class HOPEModel(nn.Module):
             return
         if self.self_mod is None:
             return
+        grad_hidden = None
+        if isinstance(self._last_context, torch.Tensor) and self._last_context.grad is not None:
+            grad_hidden = self._last_context.grad
         if self.task_count:
             if self._last_task_id is None:
                 return
             decoder = self.decoder_heads[self._last_task_id]
         else:
             decoder = self.decoder
-        grad_hidden = self._last_logits.grad @ decoder.weight.t()
+        if grad_hidden is None:
+            grad_hidden = self._last_logits.grad @ decoder.weight.t()
         self.self_mod.update_chunk(self._last_context + grad_hidden)
 
     def reset(self):
