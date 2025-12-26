@@ -187,18 +187,21 @@ class HOPEModel(nn.Module):
                     )
                 )
         config.update(overrides)
-        config.pop("cms_chunk_size", None)
-        config.pop("cms_memory_chunk_size", None)
+        cms_chunk_size = config.pop("cms_chunk_size", None)
+        cms_memory_chunk_size = config.pop("cms_memory_chunk_size", None)
         config.pop("batch_size", None)
         if preset != "adaptive" and "frequencies" not in config and "hope_levels" not in config:
             raise ValueError("frequencies (or hope_levels) must be provided when using non-adaptive presets")
-        return cls(
+        model = cls(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
             output_dim=output_dim,
             task_count=task_count,
             **config,
         )
+        model.cms_chunk_size = cms_chunk_size
+        model.cms_memory_chunk_size = cms_memory_chunk_size
+        return model
 
     def __init__(
         self,
@@ -291,6 +294,13 @@ class HOPEModel(nn.Module):
             if backbone == "titans"
             else None
         )
+        self.cms_chunk_size: int | None = None
+        self.cms_memory_chunk_size: int | None = None
+        self._ema_loss: float | None = None
+        self._ema_acc: float | None = None
+        self._best_acc: float | None = None
+        self._cms_autoscale_cooldown = 0
+        self._last_frequencies: list[int] | None = None
         self.attention = AttentionBlock(hidden_dim, heads=heads) if backbone == "attention" else None
         # Memory-Augmented Decoder to protect mapping
         self.task_count = task_count
@@ -546,6 +556,72 @@ class HOPEModel(nn.Module):
             dtype=memory_context.dtype,
         )
         decoder_mem.update(memory_context, dec_state, update=True)
+
+    def _iter_cms_blocks(self):
+        if hasattr(self.cms, "blocks"):
+            for block in self.cms.blocks:
+                yield block
+        elif hasattr(self.cms, "systems"):
+            for system in self.cms.systems:
+                for block in system.blocks:
+                    yield block
+
+    def maybe_rescale_cms(
+        self,
+        *,
+        loss: float,
+        accuracy: float | None,
+        dataset_size: int | None,
+        task_count: int | None,
+        batch_size: int | None = None,
+        spike_threshold: float = 0.25,
+        acc_drop: float = 0.05,
+        cooldown_steps: int = 50,
+    ) -> bool:
+        if not dataset_size or not task_count:
+            return False
+
+        loss_value = float(loss)
+        if self._ema_loss is None:
+            self._ema_loss = loss_value
+        else:
+            self._ema_loss = 0.9 * self._ema_loss + 0.1 * loss_value
+
+        if accuracy is not None:
+            if self._ema_acc is None:
+                self._ema_acc = accuracy
+            else:
+                self._ema_acc = 0.9 * self._ema_acc + 0.1 * accuracy
+            if self._best_acc is None or accuracy > self._best_acc:
+                self._best_acc = accuracy
+
+        if self._cms_autoscale_cooldown > 0:
+            self._cms_autoscale_cooldown -= 1
+            return False
+
+        loss_spike = self._ema_loss is not None and loss_value > self._ema_loss * (1.0 + spike_threshold)
+        acc_drop_trigger = False
+        if accuracy is not None and self._best_acc is not None:
+            acc_drop_trigger = accuracy < (self._best_acc - acc_drop)
+
+        if not (loss_spike or acc_drop_trigger):
+            return False
+
+        config = self.auto_scale_cms(
+            dataset_size,
+            task_count,
+            backbone=self.backbone,
+            batch_size=batch_size,
+        )
+        frequencies = config.get("frequencies")
+        if frequencies:
+            for block, freq in zip(self._iter_cms_blocks(), frequencies):
+                block.frequency = freq
+            self._last_frequencies = list(frequencies)
+        self.cms_chunk_size = config.get("cms_chunk_size", self.cms_chunk_size)
+        self.cms_memory_chunk_size = config.get("cms_memory_chunk_size", self.cms_memory_chunk_size)
+        self._cms_autoscale_cooldown = max(1, cooldown_steps)
+        return True
 
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:

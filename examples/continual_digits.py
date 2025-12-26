@@ -81,6 +81,10 @@ def train_task(
     task_id: int,
     replay_weight: float,
     replay_ratio: float,
+    dataset_size: int,
+    task_count: int,
+    batch_size_value: int,
+    dynamic_cms: bool,
 ):
     model.train()
     global_step = 0
@@ -122,9 +126,19 @@ def train_task(
                 loss = loss_current + replay_weight * loss_replay
                 combined_x = torch.cat([batch_x, rx], dim=0)
             else:
-                logits = model.forward(batch_x, time=global_step, task_id=task_id)
-                loss = torch.nn.functional.cross_entropy(logits, batch_y)
+                logits_current = model.forward(batch_x, time=global_step, task_id=task_id)
+                loss = torch.nn.functional.cross_entropy(logits_current, batch_y)
                 combined_x = batch_x
+
+            batch_acc = (logits_current.argmax(dim=-1) == batch_y).float().mean().item()
+            if dynamic_cms:
+                model.maybe_rescale_cms(
+                    loss=loss.item(),
+                    accuracy=batch_acc,
+                    dataset_size=dataset_size,
+                    task_count=task_count,
+                    batch_size=batch_size_value,
+                )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -133,12 +147,14 @@ def train_task(
             # 5. Update Chunk (CMS Maintenance on Mixed Data)
             # We use the combined batch for chunk updates to ensure consistency
             chunk_buffer.append(combined_x)
-            if (step // batch_size + 1) % cms_chunk_size == 0:
+            active_chunk = model.cms_chunk_size or cms_chunk_size
+            active_memory_chunk = model.cms_memory_chunk_size or cms_memory_chunk_size
+            if (step // batch_size + 1) % active_chunk == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
                 model.update_chunk(
                     chunk_x,
-                    chunk_size=cms_chunk_size,
-                    memory_chunk_size=cms_memory_chunk_size,
+                    chunk_size=active_chunk,
+                    memory_chunk_size=active_memory_chunk,
                     task_id=task_id,
                 )
                 chunk_buffer = []
@@ -148,8 +164,8 @@ def train_task(
             chunk_x = torch.cat(chunk_buffer, dim=0)
             model.update_chunk(
                 chunk_x,
-                chunk_size=cms_chunk_size,
-                memory_chunk_size=cms_memory_chunk_size,
+                chunk_size=model.cms_chunk_size or cms_chunk_size,
+                memory_chunk_size=model.cms_memory_chunk_size or cms_memory_chunk_size,
                 task_id=task_id,
             )
 
@@ -285,6 +301,10 @@ def main():
             self_mod_projection_mask=projection_mask,
             backbone=args.backbone,
         ).to(device)
+    if model.cms_chunk_size is None:
+        model.cms_chunk_size = args.cms_chunk_size
+    if model.cms_memory_chunk_size is None:
+        model.cms_memory_chunk_size = args.cms_memory_chunk_size
     base_optimizer = torch.optim.AdamW
     if args.steered_optim:
         config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
@@ -294,6 +314,7 @@ def main():
 
     task_a_epochs = args.task_a_epochs if args.task_a_epochs is not None else args.epochs
     task_b_epochs = args.task_b_epochs if args.task_b_epochs is not None else args.epochs
+    dynamic_cms = args.preset == "adaptive" and args.auto_scale
 
     train_task(
         model,
@@ -309,6 +330,10 @@ def main():
         task_id=0,
         replay_weight=args.replay_weight,
         replay_ratio=args.replay_ratio,
+        dataset_size=total_train,
+        task_count=2,
+        batch_size_value=args.batch_size,
+        dynamic_cms=dynamic_cms,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
@@ -338,6 +363,10 @@ def main():
         task_id=1,
         replay_weight=args.replay_weight,
         replay_ratio=args.replay_ratio,
+        dataset_size=total_train,
+        task_count=2,
+        batch_size_value=args.batch_size,
+        dynamic_cms=dynamic_cms,
     )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
