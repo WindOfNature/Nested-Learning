@@ -73,6 +73,75 @@ class HOPEModel(nn.Module):
             "memory_decay": memory_decay,
         }
 
+    @staticmethod
+    def auto_scale_cms(
+        dataset_size: int | None,
+        task_count: int | None,
+        *,
+        backbone: str = "titans",
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        if not dataset_size or not task_count:
+            return {}
+
+        if backbone == "attention":
+            return {
+                "frequencies": [1, 8, 16],
+                "cms_depth": 2,
+                "cms_chunk_size": 8,
+                "cms_memory_chunk_size": 16,
+            }
+
+        steps_per_task = max(1, dataset_size // task_count)
+        if batch_size:
+            steps_per_task = max(1, steps_per_task // batch_size)
+
+        if steps_per_task <= 32:
+            return {
+                "frequencies": [1, 2, 4, 8],
+                "cms_depth": 2,
+                "cms_chunk_size": 4,
+                "cms_memory_chunk_size": 4,
+            }
+
+        base_freq = max(8, int(round(steps_per_task * 4)))
+        max_freq = min(2048, 2 ** int(round(math.log2(base_freq))))
+
+        level_count = 2
+        if task_count >= 2 or dataset_size >= 1024:
+            level_count = 3
+        if task_count >= 4 or dataset_size >= 20000:
+            level_count = 4
+
+        if level_count == 1:
+            frequencies = [1]
+        else:
+            log_span = max(1.0, math.log2(max_freq))
+            frequencies = []
+            for idx in range(level_count):
+                exp = idx * log_span / (level_count - 1)
+                freq = int(2 ** round(exp))
+                if frequencies and freq <= frequencies[-1]:
+                    freq = min(max_freq, frequencies[-1] * 2)
+                frequencies.append(max(1, freq))
+
+        cms_depth = 2
+        if dataset_size >= 5000 or task_count >= 4:
+            cms_depth = 3
+        if dataset_size >= 50000:
+            cms_depth = 4
+
+        chunk_base = max(8, int(round(steps_per_task)))
+        cms_chunk_size = min(128, max(4, chunk_base))
+        cms_memory_chunk_size = min(256, max(cms_chunk_size, int(cms_chunk_size * 2)))
+
+        return {
+            "frequencies": frequencies,
+            "cms_depth": cms_depth,
+            "cms_chunk_size": cms_chunk_size,
+            "cms_memory_chunk_size": cms_memory_chunk_size,
+        }
+
     @classmethod
     def from_preset(
         cls,
@@ -86,12 +155,14 @@ class HOPEModel(nn.Module):
         auto_scale: bool = True,
         **overrides: Any,
     ) -> "HOPEModel":
+        backbone = overrides.get("backbone", "titans")
         config = cls.preset_config(preset)
         if auto_scale:
             config.update(cls.auto_scale_config(dataset_size, task_count))
+            config.update(cls.auto_scale_cms(dataset_size, task_count, backbone=backbone))
         config.update(overrides)
-        if "frequencies" not in config and "hope_levels" not in config:
-            raise ValueError("frequencies (or hope_levels) must be provided when using presets")
+        config.pop("cms_chunk_size", None)
+        config.pop("cms_memory_chunk_size", None)
         return cls(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -130,8 +201,9 @@ class HOPEModel(nn.Module):
         super().__init__()
         if frequencies is None:
             if hope_levels is None:
-                raise ValueError("frequencies or hope_levels must be provided")
-            frequencies = [lowest_frequency * (2**idx) for idx in range(hope_levels)]
+                frequencies = [1, 8, 16]
+            else:
+                frequencies = [lowest_frequency * (2**idx) for idx in range(hope_levels)]
         self.encoder = Linear(input_dim, hidden_dim)
         self.pre_norm = LayerNorm(hidden_dim) if use_pre_norm else None
         self.post_norm = LayerNorm(hidden_dim) if use_post_norm else None

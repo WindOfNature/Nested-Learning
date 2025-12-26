@@ -43,13 +43,25 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
         if args.replay_ratio > 0.0:
             args.replay_ratio = auto_config.get("replay_ratio", args.replay_ratio)
         args.memory_decay = auto_config.get("memory_decay", args.memory_decay)
-        if args.backbone == "titans":
-            args.cms_chunk_size = max(2, int(np.sqrt(dataset_size) // 8))
-            args.cms_memory_chunk_size = max(args.cms_chunk_size, int(np.sqrt(dataset_size) // 6))
         if args.replay_weight > 0.0:
             args.replay_weight = min(0.3, 0.05 + 0.02 * task_count)
         if args.task_b_epochs is None:
             args.task_b_epochs = max(args.epochs, 10)
+
+    cms_config = HOPEModel.auto_scale_cms(
+        dataset_size,
+        task_count,
+        backbone=args.backbone,
+        batch_size=args.batch_size,
+    )
+    if args.cms_frequencies is None:
+        args.cms_frequencies = cms_config.get("frequencies", args.cms_frequencies)
+    if args.cms_depth is None:
+        args.cms_depth = cms_config.get("cms_depth", args.cms_depth)
+    if args.cms_chunk_size is None:
+        args.cms_chunk_size = cms_config.get("cms_chunk_size", args.cms_chunk_size)
+    if args.cms_memory_chunk_size is None:
+        args.cms_memory_chunk_size = cms_config.get("cms_memory_chunk_size", args.cms_memory_chunk_size)
 
     return args
 
@@ -170,10 +182,10 @@ def main():
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--cms-frequencies", type=str, required=True)
-    parser.add_argument("--cms-depth", type=int, required=True)
-    parser.add_argument("--cms-chunk-size", type=int, required=True)
-    parser.add_argument("--cms-memory-chunk-size", type=int, required=True)
+    parser.add_argument("--cms-frequencies", type=str, default=None)
+    parser.add_argument("--cms-depth", type=int, default=None)
+    parser.add_argument("--cms-chunk-size", type=int, default=None)
+    parser.add_argument("--cms-memory-chunk-size", type=int, default=None)
     parser.add_argument("--preset", type=str, default="balanced", choices=["balanced", "fast_adapt", "high_retention", "custom"])
     parser.add_argument("--auto-scale", dest="auto_scale", action="store_true", default=True)
     parser.add_argument("--no-auto-scale", dest="auto_scale", action="store_false")
@@ -198,7 +210,8 @@ def main():
     parser.add_argument("--optimizer-state-path", type=str, default="")
     parser.add_argument("--reset-optimizer-between-tasks", action="store_true")
     args = parser.parse_args()
-    args.cms_frequencies = [int(item.strip()) for item in args.cms_frequencies.split(",") if item.strip()]
+    if args.cms_frequencies:
+        args.cms_frequencies = [int(item.strip()) for item in args.cms_frequencies.split(",") if item.strip()]
 
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)

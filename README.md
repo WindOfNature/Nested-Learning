@@ -89,8 +89,6 @@ model = HOPEModel.from_preset(
     preset="balanced",
     dataset_size=10_000,
     task_count=4,
-    frequencies=[1, 2, 4, 8],
-    cms_depth=2,
     backbone="attention",
 )
 
@@ -102,11 +100,7 @@ logits = model(x, time=0)
 
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
-  --max-samples 500 \
-  --cms-frequencies 1,2,4,8 \
-  --cms-depth 2 \
-  --cms-chunk-size 4 \
-  --cms-memory-chunk-size 4
+  --max-samples 500
 ```
 
 ### D) CMS multi-level frequencies
@@ -235,21 +229,23 @@ not required for a solid baseline.
 ### Presets & Auto-scale (recommended)
 
 If you don’t want to tune hyperparameters, use `preset="balanced"` with
-`auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, and
-memory decay based on dataset size and task count.
+`auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, memory
+decay, and (for Titans) CMS frequencies/depth/chunk sizes based on dataset size
+and task count.
 
 > Note: Presets default to **no replay**. Replay is only active if you pass
 > non-zero `replay_ratio` and `replay_weight` in your training code.
 
-### CMS Hyperparameters (required for presets)
+### CMS Hyperparameters (auto-scaled)
 
 `frequencies` defines the CMS update rates (Eq. 70–71 in the paper). `cms_depth`
-controls the per-level MLP depth inside each memory block. In the digits example
-we pass `--cms-frequencies` and `--cms-depth` explicitly, and CMS chunk sizes
-are configured via `--cms-chunk-size` / `--cms-memory-chunk-size`.
+controls the per-level MLP depth inside each memory block. By default, HOPE
+auto-scales CMS **frequencies/depth/chunk sizes** when using the Titans
+backbone, and uses a fixed schedule when using Hope-Attention. You can still
+override any of them via `--cms-*` flags or constructor arguments.
 
 `hope_levels` + `lowest_frequency` can still be used as a convenience to generate
-frequencies, but presets expect explicit `frequencies` for CMS configuration.
+frequencies, but presets no longer require explicit CMS configuration.
 ---
 
 ## Optimizer State Persistence (Continual Learning)
@@ -268,10 +264,10 @@ load_optimizer_state(optimizer, "optim_state.pt")
 Example run (as in the paper’s continual-learning style setup):
 
 ```
-Task A accuracy before: 0.558
-Task B accuracy: 0.883
-Task A accuracy after: 0.680
-Forgetting: -0.122
+Task A accuracy before: 0.740
+Task B accuracy: 0.933
+Task A accuracy after: 0.785
+Forgetting: -0.044
 ```
 * Accuracy is shown for the default preset + auto-scale settings using 500 max samples (replay disabled).
 ---
