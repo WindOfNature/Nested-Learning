@@ -21,7 +21,7 @@ and may contain inaccuracies/imcomplete relative to the paper. Issues and PRs ar
 - **Continuum Memory System (CMS)** with multi-timescale update, decay, and replay.
 - **Associative Memory** with parametric & non-parametric modes and **Hebbian / Delta / Oja** rules.
 - **Expressive optimizers**: DGD, GGD, GM, plus a steered wrapper over `torch.optim`.
-- **CPU (Numba) + GPU (Triton)** kernels for matmul and layernorm.
+- **Note**: Custom kernels are currently disabled to ensure correct Autograd behavior during Meta-Learning.
 
 ---
 

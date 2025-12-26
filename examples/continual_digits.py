@@ -40,19 +40,42 @@ def train_task(
     memory_chunk_size: int,
 ):
     model.train()
+    global_step = 0
     for epoch in range(epochs):
         indices = rng.permutation(len(x))
         chunk_buffer = []
         for step in range(0, len(indices), batch_size):
+            global_step += 1
             batch_idx = indices[step : step + batch_size]
             batch_x = torch.tensor(x[batch_idx], device=device)
             batch_y = torch.tensor(y[batch_idx], device=device)
-            logits = model.forward(batch_x, time=epoch * len(x) + step)
-            loss = torch.nn.functional.cross_entropy(logits, batch_y)
+
+            # 1. Remember new data
+            model.remember(batch_x, batch_y)
+
+            # 2. Sample Replay
+            replay_data = model.sample_replay(batch_size // 2)
+
+            # 3. Mix
+            if replay_data is not None:
+                rx, ry = replay_data
+                combined_x = torch.cat([batch_x, rx], dim=0)
+                combined_y = torch.cat([batch_y, ry], dim=0)
+            else:
+                combined_x = batch_x
+                combined_y = batch_y
+
+            # 4. Train on Combined Batch (Encoder, Decoder, Memory all learn from mixed)
+            logits = model.forward(combined_x, time=global_step)
+            loss = torch.nn.functional.cross_entropy(logits, combined_y)
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            chunk_buffer.append(batch_x)
+
+            # 5. Update Chunk (CMS Maintenance on Mixed Data)
+            # We use the combined batch for chunk updates to ensure consistency
+            chunk_buffer.append(combined_x)
             if (step // batch_size + 1) % chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
                 model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
@@ -89,10 +112,10 @@ def main():
     parser.add_argument("--cms-variant", type=str, default="nested", choices=["nested", "sequential", "headwise", "chain"])
     parser.add_argument("--nested-depth", type=int, default=2)
     parser.add_argument("--nested-hidden", type=int, default=128)
-    parser.add_argument("--memory-decay", type=float, default=0.1)
-    parser.add_argument("--replay-ratio", type=float, default=0.2)
+    parser.add_argument("--memory-decay", type=float, default=0.01)
+    parser.add_argument("--replay-ratio", type=float, default=0.5)
     parser.add_argument("--replay-steps", type=int, default=1)
-    parser.add_argument("--replay-buffer", type=int, default=128)
+    parser.add_argument("--replay-buffer", type=int, default=2000)
     parser.add_argument("--self-mod-depth", type=int, default=3)
     parser.add_argument("--self-mod-query-static", action="store_true")
     parser.add_argument("--backbone", type=str, default="titans", choices=["titans", "attention"])
@@ -132,7 +155,7 @@ def main():
         input_dim=64,
         hidden_dim=128,
         output_dim=5,
-        frequencies=None if args.hope_levels else [1, 5, 10],
+        frequencies=None if args.hope_levels else [1, 2, 4, 8],
         cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
         self_mod_depth=args.self_mod_depth,
         heads=4,

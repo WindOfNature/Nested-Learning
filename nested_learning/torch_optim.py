@@ -22,29 +22,32 @@ class DGD(torch.optim.Optimizer):
         defaults = dict(lr=lr, beta=beta, alpha=alpha, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-    @torch.no_grad()
     def step(self, closure=None, lr_override: float | None = None, weight_decay_override: float | None = None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-        for group in self.param_groups:
-            lr = group["lr"] if lr_override is None else lr_override
-            beta = group["beta"]
-            alpha = group["alpha"]
-            weight_decay = group["weight_decay"] if weight_decay_override is None else weight_decay_override
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                state = self.state[param]
-                if "memory" not in state:
-                    state["memory"] = torch.zeros_like(param)
-                grad = param.grad
-                delta = grad + alpha * (grad - state["memory"])
-                if weight_decay:
-                    delta = delta + weight_decay * param
-                param.add_(delta, alpha=-lr)
-                state["memory"].mul_(beta).add_(grad, alpha=1 - beta)
+
+        # We need no_grad for in-place updates on leaf tensors, even if we wanted meta-learning.
+        # Since we avoid MAML, we don't strictly need differentiable optimizer step.
+        with torch.no_grad():
+            for group in self.param_groups:
+                lr = group["lr"] if lr_override is None else lr_override
+                beta = group["beta"]
+                alpha = group["alpha"]
+                weight_decay = group["weight_decay"] if weight_decay_override is None else weight_decay_override
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+                    state = self.state[param]
+                    if "memory" not in state:
+                        state["memory"] = torch.zeros_like(param)
+                    grad = param.grad
+                    delta = grad + alpha * (grad - state["memory"])
+                    if weight_decay:
+                        delta = delta + weight_decay * param
+                    param.add_(delta, alpha=-lr)
+                    state["memory"].mul_(beta).add_(grad, alpha=1 - beta)
         return loss
 
 

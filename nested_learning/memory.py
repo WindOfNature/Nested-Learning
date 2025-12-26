@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Sequence
+from typing import Any, Deque, List, Sequence
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,7 @@ class MemoryBlock(nn.Module):
         frequency: int,
         depth: int,
         decay: float = 0.0,
-        replay_ratio: float = 0.0,
+        replay_ratio: float = 0.25,
         replay_steps: int = 1,
         replay_buffer: int = 128,
     ):
@@ -35,52 +36,145 @@ class MemoryBlock(nn.Module):
         self.frequency = frequency
         self.layers = nn.ModuleList([Linear(features, features) for _ in range(depth)])
         self.norm = LayerNorm(features)
-        self.register_buffer("state_value", torch.zeros(1, features))
-        self.state_time = 0
         self.decay = decay
         self.replay_ratio = replay_ratio
         self.replay_steps = replay_steps
         self.replay_buffer: Deque[torch.Tensor] = deque(maxlen=replay_buffer)
-        self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
         self.meta = MemoryMLP(features)
         self.malpha = MemoryMLP(features)
+        # Only optimize memory content parameters (layers, norm) in the inner loop.
+        # Meta-parameters (meta, malpha) are optimized by the outer loop (Task Loss).
+        fast_params = list(self.layers.parameters()) + list(self.norm.parameters())
+        self.optimizer = DGD(fast_params, lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
+        self.step_counter = 0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x
+    def forward(self, x: torch.Tensor, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Pre-Norm Stability: Normalize input for processing
+        x_ln = self.norm(x)
+        # L2 Norm for Attention-like stability (prevent signal explosion in gates)
+        x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+        # Memory content generation (MLP)
+        # Use x_l2 for stability
+        mem = x_l2
         for layer in self.layers:
-            out = F.relu(layer(out))
-        return self.norm(out)
+            mem = F.relu(layer(mem))
+        # No output normalization
 
-    def update(self, x: torch.Tensor, time: int, update: bool = True):
-        if not update or time % self.frequency != 0:
-            return
-        with torch.enable_grad():
-            x_detached = x.detach()
-            out = self.forward(x_detached)
-            eta = F.softplus(self.meta(x_detached)).mean().clamp(min=1e-5).item()
-            alpha = torch.sigmoid(self.malpha(x_detached)).mean().clamp(min=1e-5).item()
-            loss = F.mse_loss(out, x_detached)
+        # Meta-learning signals using stabilized input
+        eta = torch.sigmoid(self.meta(x_l2)) * 0.1
+        alpha = torch.sigmoid(self.malpha(x_l2))
+
+        # Gated residual update on ORIGINAL x
+        out = x + eta * mem
+
+        # Continuum state update (BPTT friendly)
+        if self.decay > 0.0:
+            new_hidden = (1.0 - self.decay) * hidden_state + self.decay * mem
+        else:
+            new_hidden = mem
+
+        return out, new_hidden, eta, alpha, mem
+
+    def update(self, x: torch.Tensor, hidden_state: torch.Tensor, update: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        if not update:
+            # Just forward pass
+            out, new_hidden, _, _, _ = self.forward(x, hidden_state)
+            return out, new_hidden
+
+        self.step_counter += 1
+
+        # Forward pass with gradients
+        out, new_hidden, eta_tensor, alpha_tensor, mem = self.forward(x, hidden_state)
+
+        if self.step_counter % self.frequency == 0:
+            # We need to perform optimization step.
+
+            # Loss for weight update (Local Reconstruction)
+            # We must NOT backprop to eta (Meta) OR x (Encoder) here.
+            # Local loss should only update the Memory Content weights (layers).
+
+            x_det = x.detach()
+            # Recompute mem with detached input using same normalization
+            x_ln = self.norm(x_det)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+            mem_local = x_l2
+            for layer in self.layers:
+                mem_local = F.relu(layer(mem_local))
+            # No output norm
+
+            # Reconstruct out locally
+            out_local = x_det + eta_tensor.detach() * mem_local
+            loss = F.mse_loss(out_local, x_det)
+
             if self.replay_ratio > 0.0 and self.replay_buffer:
                 replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
-                for _ in range(self.replay_steps):
-                    replay_samples = list(self.replay_buffer)[-replay_count:]
-                    replay_batch = torch.cat(replay_samples, dim=0)
-                    replay_out = self.forward(replay_batch)
+                if len(self.replay_buffer) >= replay_count:
+                    # Buffer stores samples (Tensor[Dim])
+                    replay_samples = random.sample(self.replay_buffer, replay_count)
+                    replay_batch = torch.stack(replay_samples, dim=0)
+
+                    # Replay forward pass with zero state (assuming independence)
+                    # Note: We need a new state tensor matching replay_batch size
+                    replay_zeros = torch.zeros(replay_batch.size(0), self.norm.gamma.size(0), device=replay_batch.device)
+
+                    # We only care about weight updates, so we ignore hidden state output
+                    replay_out, _, _, _, _ = self.forward(replay_batch, replay_zeros)
                     loss = loss + F.mse_loss(replay_out, replay_batch)
+
             self.optimizer.zero_grad()
             loss.backward()
-            self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
-        with torch.no_grad():
-            if self.decay > 0.0:
-                self.state_value.mul_(1.0 - self.decay)
-                self.state_value.add_(out.mean(dim=0, keepdim=True) * self.decay)
-            else:
-                self.state_value.copy_(out.mean(dim=0, keepdim=True))
-            self.state_time = time
-            self.replay_buffer.append(x_detached)
+
+            # Extract scalar values for optimizer (or mean)
+            eta_val = eta_tensor.mean().item()
+            alpha_val = alpha_tensor.mean().item()
+
+            # Fix retention logic: decay = (1.0 - alpha) * scale
+            # Hard Retention: Lock neurons if alpha > 0.9
+            mask = 1.0 if alpha_val > 0.9 else 0.0
+            weight_decay = (1.0 - alpha_val) * 1e-4 * (1.0 - mask)
+
+            self.optimizer.step(lr_override=eta_val, weight_decay_override=weight_decay)
+
+            # Recompute memory content with updated weights to allow gradient flow
+            # The weights have changed, so we must re-run the forward pass for 'mem'
+            # to attach it to the graph correctly for downstream tasks.
+            # Note: We must re-compute normalization on x (attached)
+            x_ln = self.norm(x)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+            # Recompute eta using new norm (since norm was updated)
+            eta_new = torch.sigmoid(self.meta(x_l2)) * 0.1
+
+            mem_new = x_l2
+            for layer in self.layers:
+                mem_new = F.relu(layer(mem_new))
+            # No output norm
+
+            # Use new memory content
+            mem = mem_new
+            eta_tensor = eta_new
+
+        # Update replay buffer (detached)
+        if self.replay_ratio > 0.0:
+             # Store samples, not batches
+             self.replay_buffer.extend(x.detach().unbind(0))
+
+        # Return attached output for end-to-end learning
+        out_final = x + eta_tensor * mem
+
+        # Fix Hidden State Detachment:
+        if self.decay > 0.0:
+            new_hidden = (1.0 - self.decay) * hidden_state + self.decay * mem
+        else:
+            new_hidden = mem
+
+        return out_final, new_hidden.detach()
 
     def state(self) -> MemoryState:
-        return MemoryState(time=self.state_time, value=self.state_value)
+        # Placeholder as state is now external
+        return MemoryState(time=0, value=torch.zeros(1))
 
 
 class ContinuumMemorySystem(nn.Module):
@@ -115,12 +209,19 @@ class ContinuumMemorySystem(nn.Module):
         )
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time: int, states: List[torch.Tensor] | None = None, update: bool = True) -> tuple[torch.Tensor, List[torch.Tensor]]:
         context = x
-        for block in self.blocks:
-            block.update(context, time, update=update)
-            context = context + block.state_value
-        return context
+        new_states = []
+        if states is None:
+            states = [torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype) for _ in self.blocks]
+
+        for block, state in zip(self.blocks, states):
+            # Chain: context = block.forward(context) which is handled by update returning out
+            out, new_state = block.update(context, state, update=update)
+            context = out # Compositional chain
+            new_states.append(new_state)
+
+        return context, new_states
 
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
@@ -172,13 +273,38 @@ class NestedContinuumMemorySystem(nn.Module):
         )
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time: int, states: List[Any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[Any]]:
         context = x
-        for block, sub in zip(self.blocks, self.subsystems):
-            block.update(context, time, update=update)
-            nested_context = sub.forward(context, time, update=update)
-            context = context + block.state_value + nested_context
-        return context
+        new_states = []
+        if states is None:
+            # Need recursive state init?
+            # State structure: [(block_state, sub_system_states), ...]
+            states = [None] * len(self.blocks)
+
+        for idx, (block, sub) in enumerate(zip(self.blocks, self.subsystems)):
+            current_state_pair = states[idx]
+            if current_state_pair is None:
+                block_state = torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype)
+                sub_states = None
+            else:
+                block_state, sub_states = current_state_pair
+
+            out, new_block_state = block.update(context, block_state, update=update)
+
+            # Nested context flow: sub system processes the output of the block?
+            # Original: nested_context = sub.forward(context...) -> context + block.state + nested
+            # New chain logic: context -> block -> sub -> context?
+            # Or context -> (block + sub)?
+            # "Fix CMS Chain ... Change to context = block.forward(context)" applies to linear chain.
+            # Nested is tricky. "Fully nested CMS where each block owns a sub-CMS."
+            # Maybe: context = sub(block(context))?
+
+            nested_out, new_sub_states = sub.forward(out, time, states=sub_states, update=update)
+
+            context = nested_out # Compositional
+            new_states.append((new_block_state, new_sub_states))
+
+        return context, new_states
 
     def states(self) -> List[MemoryState]:
         states: List[MemoryState] = []
@@ -221,12 +347,19 @@ class SequentialContinuumMemorySystem(nn.Module):
         self.norm = LayerNorm(features)
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time: int, states: List[torch.Tensor] | None = None, update: bool = True) -> tuple[torch.Tensor, List[torch.Tensor]]:
         context = x
-        for block in self.blocks:
-            block.update(context, time, update=update)
-            context = self.norm(context + block.state_value)
-        return context
+        new_states = []
+        if states is None:
+            states = [torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype) for _ in self.blocks]
+
+        for block, state in zip(self.blocks, states):
+            out, new_state = block.update(context, state, update=update)
+            # Sequential uses norm on the output
+            context = self.norm(out)
+            new_states.append(new_state)
+
+        return context, new_states
 
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
@@ -267,14 +400,23 @@ class HeadwiseContinuumMemorySystem(nn.Module):
         )
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, time: int, states: List[Any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[Any]]:
         chunks = []
+        new_states = []
+        if states is None:
+            states = [None] * self.heads
+
         for head in range(self.heads):
             start = head * self.head_dim
             end = start + self.head_dim
             chunk = x[:, start:end]
-            chunks.append(self.systems[head].forward(chunk, time, update=update))
-        return torch.cat(chunks, dim=-1)
+
+            head_state = states[head]
+            out, new_head_state = self.systems[head].forward(chunk, time, states=head_state, update=update)
+            chunks.append(out)
+            new_states.append(new_head_state)
+
+        return torch.cat(chunks, dim=-1), new_states
 
     def states(self) -> List[MemoryState]:
         states: List[MemoryState] = []

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import torch
 import torch.nn as nn
@@ -15,13 +16,15 @@ from .memory import (
     NestedContinuumMemorySystem,
     SequentialContinuumMemorySystem,
     HeadwiseContinuumMemorySystem,
+    MemoryBlock,
 )
 
 
 @dataclass
 class HopeState:
     time: int
-    memory: torch.Tensor
+    memory: List[Any] | None  # Supports nested list of states
+    decoder_memory: Any | None = None
 
 
 class HOPEModel(nn.Module):
@@ -45,7 +48,7 @@ class HOPEModel(nn.Module):
         replay_ratio: float = 0.0,
         replay_steps: int = 1,
         replay_buffer: int = 128,
-        use_conv: bool = True,
+        use_conv: bool = False,
         conv_kernel: int = 3,
         use_pre_norm: bool = True,
         use_post_norm: bool = True,
@@ -110,11 +113,44 @@ class HOPEModel(nn.Module):
             else None
         )
         self.attention = AttentionBlock(hidden_dim, heads=heads) if backbone == "attention" else None
+        # Memory-Augmented Decoder to protect mapping
+        self.decoder_mem = MemoryBlock(
+            hidden_dim,
+            frequency=1,
+            depth=1,
+            replay_ratio=replay_ratio,
+            replay_buffer=replay_buffer
+        )
         self.decoder = Linear(hidden_dim, output_dim)
         self.norm = LayerNorm(hidden_dim)
-        self.state = HopeState(time=0, memory=torch.zeros(1, hidden_dim))
+        self.final_norm = LayerNorm(hidden_dim) # Protect decoder from signal explosion
+        self.state = HopeState(time=0, memory=None, decoder_memory=None)
+
+        self.replay_ratio = replay_ratio
+        self.replay_steps = replay_steps
+        self.raw_replay_buffer = deque(maxlen=replay_buffer)
+
         self._last_context: torch.Tensor | None = None
         self._last_logits: torch.Tensor | None = None
+
+    def remember(self, x: torch.Tensor, y: torch.Tensor):
+        # Store raw experience as tuples (x, y)
+        x_detached = x.detach().cpu()
+        y_detached = y.detach().cpu()
+        for i in range(x.size(0)):
+            self.raw_replay_buffer.append((x_detached[i], y_detached[i]))
+
+    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if len(self.raw_replay_buffer) < batch_size:
+            return None
+        import random
+        samples = random.sample(self.raw_replay_buffer, batch_size)
+        x_list, y_list = zip(*samples)
+        # Move to device of current parameters
+        device = self.decoder.weight.device
+        x_batch = torch.stack(x_list).to(device)
+        y_batch = torch.stack(y_list).to(device)
+        return x_batch, y_batch
 
     def forward(self, x: torch.Tensor, time: int, update_memory: bool = True) -> torch.Tensor:
         encoded = F.relu(self.encoder(x))
@@ -125,7 +161,43 @@ class HOPEModel(nn.Module):
                 encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
-        memory_context = self.cms.forward(encoded, time, update=update_memory)
+
+        # CMS update with state passing
+        current_states = self.state.memory
+        # If batch size changed (e.g. last batch), reset states to avoid mismatch
+        if current_states is not None:
+             # Check first state tensor if available
+             # current_states is a list. It might contain Tensors or lists (nested).
+             # We need to find a tensor to check dimension.
+             # Simply: if we catch an error, or check proactively.
+             # Proactive check:
+             # Flatten structure to find first tensor?
+             # Or just try/except? No.
+             # Let's assume flat list for simple CMS, nested for others.
+             # We'll just reset if x.size(0) doesn't match expected.
+             # BUT we don't know expected easily without inspecting current_states.
+             # Let's just catch size mismatch by checking the first block state if possible.
+             # Or safer: if current_states matches x size.
+             pass
+             # Easier: Just pass current_states. If None, CMS inits.
+             # If dimensions mismatch, CMS will crash.
+             # So we must check.
+
+        # Helper to check batch dimension match
+        def check_batch_dim(states, batch_size):
+            if states is None: return False
+            if isinstance(states, (list, tuple)):
+                if not states: return True
+                return check_batch_dim(states[0], batch_size)
+            if isinstance(states, torch.Tensor):
+                return states.size(0) == batch_size
+            return True # Unknown type
+
+        if not check_batch_dim(current_states, encoded.size(0)):
+             current_states = None
+
+        memory_context, new_cms_states = self.cms.forward(encoded, time, states=current_states, update=update_memory)
+
         if self.nested_flow is not None:
             memory_context = self.nested_flow.forward(memory_context, time, update=update_memory)
         if self.backbone == "attention":
@@ -135,9 +207,38 @@ class HOPEModel(nn.Module):
         normed = self.norm(modulated)
         if self.post_norm is not None:
             normed = self.post_norm(normed)
-        logits = self.decoder(normed)
+
+        # Update Decoder Memory
+        dec_state = self.state.decoder_memory
+        # Check dim
+        if dec_state is not None and dec_state.size(0) != normed.size(0):
+            dec_state = None
+        if dec_state is None:
+            dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
+
+        normed_mem, new_dec_state = self.decoder_mem.update(normed, dec_state, update=update_memory)
+
+        # Apply Final Norm before Linear Decoder
+        logits = self.decoder(self.final_norm(normed_mem))
         if update_memory:
-            self.state = HopeState(time=time, memory=memory_context.detach())
+            # We detach states to prevent infinite graph growth across steps,
+            # but for BPTT within a window we might want to keep it?
+            # Standard RNN practice is detach between batches.
+            # Here we assume user handles truncation or we detach.
+            # But wait, "Fix BPTT Break" suggests we want gradients.
+            # If we detach here, we break BPTT across calls to forward.
+            # Assuming typical usage (like in examples), forward is called per batch.
+            # States should probably be detached unless doing TBPTT.
+            # The prompt says "Fix BPTT Break: Updating state_value inside no_grad breaks... Pass hidden_state explicitly".
+            # This allows gradients to flow IF the user wants them (e.g. sequence training).
+            # But we store it in self.state.
+            # I will detach here to be safe for infinite loops, but return/keep graph if needed?
+            # self.state is used for next step.
+            self.state = HopeState(
+                time=time,
+                memory=[s.detach() if isinstance(s, torch.Tensor) else s for s in new_cms_states],
+                decoder_memory=new_dec_state.detach()
+            )
             self._last_context = memory_context
             logits.retain_grad()
             self._last_logits = logits
@@ -149,6 +250,13 @@ class HOPEModel(nn.Module):
         chunk_size: int | None = None,
         memory_chunk_size: int | None = None,
     ):
+        # Flatten if 3D (Batch, Seq, Dim) -> (Batch*Seq, Dim)
+        if x.dim() == 3:
+            x = x.view(-1, x.shape[-1])
+
+        # Replay mixing is handled externally now.
+        # update_chunk simply processes the provided input x (which is already mixed).
+
         encoded = F.relu(self.encoder(x))
         if self.pre_norm is not None:
             encoded = self.pre_norm(encoded)
@@ -157,6 +265,12 @@ class HOPEModel(nn.Module):
                 encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
+
+        # Step E: Update CMS
+        # We pass update=True to allow CMS to learn from this mixed batch.
+        # State is reset (None) for mixed/offline update.
+        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=None, update=True)
+
         if self.nested_flow is not None:
             encoded = self.nested_flow.forward(encoded, time=self.state.time, update=True)
         if self.self_mod is not None:
@@ -167,6 +281,20 @@ class HOPEModel(nn.Module):
                 projection_mask=self.self_mod_projection_mask,
             )
 
+        # Update Decoder Memory in chunk
+        if self.self_mod is not None:
+             modulated = self.self_mod(encoded)
+        else:
+             modulated = encoded
+
+        normed = self.norm(modulated)
+        if self.post_norm is not None:
+            normed = self.post_norm(normed)
+
+        # Reset state for chunk update
+        dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
+        self.decoder_mem.update(normed, dec_state, update=True)
+
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:
             return
@@ -174,4 +302,19 @@ class HOPEModel(nn.Module):
         self.self_mod.update_chunk(self._last_context + grad_hidden)
 
     def reset(self):
-        self.state = HopeState(time=0, memory=torch.zeros_like(self.state.memory))
+        self.state = HopeState(time=0, memory=None, decoder_memory=None)
+        # Clear CMS internal buffers if any (e.g. state_value in blocks was removed, but what about others?)
+        # Step counter?
+        # Iterate through blocks and reset buffers?
+        # "Fix Reset Logic: Iterate through self.cms.blocks and zero out their internal state_value buffers."
+        # I removed state_value buffers. But I should reset step_counter.
+        if hasattr(self.cms, "blocks"):
+             for block in self.cms.blocks:
+                 block.step_counter = 0
+                 # If block has other states...
+        if hasattr(self.cms, "systems"): # Headwise
+             for sys in self.cms.systems:
+                  for block in sys.blocks:
+                       block.step_counter = 0
+        if hasattr(self, "decoder_mem"):
+             self.decoder_mem.step_counter = 0

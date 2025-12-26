@@ -18,9 +18,7 @@ classifiers = [
 
 dependencies = [
   "numpy>=1.23",
-  "numba>=0.58",
   "torch>=2.1",
-  "triton>=2.1",
 ]
 
 [project.optional-dependencies]
