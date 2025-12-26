@@ -89,7 +89,7 @@ def main():
     parser.add_argument("--cms-variant", type=str, default="nested", choices=["nested", "sequential", "headwise", "chain"])
     parser.add_argument("--nested-depth", type=int, default=2)
     parser.add_argument("--nested-hidden", type=int, default=128)
-    parser.add_argument("--memory-decay", type=float, default=0.1)
+    parser.add_argument("--memory-decay", type=float, default=0.01)
     parser.add_argument("--replay-ratio", type=float, default=0.25)
     parser.add_argument("--replay-steps", type=int, default=1)
     parser.add_argument("--replay-buffer", type=int, default=2000)
@@ -132,7 +132,7 @@ def main():
         input_dim=64,
         hidden_dim=128,
         output_dim=5,
-        frequencies=None if args.hope_levels else [1, 5, 10],
+        frequencies=None if args.hope_levels else [1, 2, 4, 8, 64],
         cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
         self_mod_depth=args.self_mod_depth,
         heads=4,
