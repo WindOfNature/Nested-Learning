@@ -105,43 +105,30 @@ class HOPEModel(nn.Module):
         if batch_size:
             steps_per_task = max(1, math.ceil(steps_per_task / batch_size))
 
-        if steps_per_task <= 32:
-            return {
-                "frequencies": [1, 4, 8, 16],
-                "cms_depth": 2,
-                "cms_chunk_size": 4,
-                "cms_memory_chunk_size": 4,
-            }
-
         def snap_pow2(value: float, minimum: int = 1) -> int:
             return max(minimum, int(2 ** round(math.log2(max(value, 1)))))
 
         scale = 2 + task_count
-        base_min = 64 if task_count <= 1 else 128
+        base_min = 128
         slowest_target = max(base_min, int(round(steps_per_task * scale)))
         if dataset_size >= 10000 or task_count >= 4:
             slowest_target = max(slowest_target, 512)
         if dataset_size >= 50000 or task_count >= 8:
             slowest_target = max(slowest_target, 2048)
-        slowest_chunk = min(8192, snap_pow2(slowest_target, minimum=4))
+        slowest_chunk = min(8192, snap_pow2(slowest_target, minimum=128))
 
-        level_count = 2
-        if task_count >= 2 or dataset_size >= 512:
-            level_count = 4
-
-        if level_count == 1:
-            frequencies = [1]
-        else:
-            log_span = math.log2(slowest_chunk)
-            frequencies = []
-            for idx in range(level_count):
-                exp = idx * log_span / (level_count - 1)
-                freq = snap_pow2(2 ** exp)
-                freq = min(slowest_chunk, freq)
-                if frequencies and freq <= frequencies[-1]:
-                    freq = min(slowest_chunk, frequencies[-1] * 2)
-                frequencies.append(freq)
-            frequencies[-1] = slowest_chunk
+        base_frequencies = [1, 16, 32, 64]
+        frequencies = base_frequencies + [slowest_chunk]
+        frequencies = sorted(set(frequencies))
+        while len(frequencies) < 5:
+            candidate = frequencies[-1] * 2
+            if candidate > slowest_chunk:
+                candidate = slowest_chunk
+            if candidate == frequencies[-1]:
+                break
+            frequencies.append(candidate)
+        if len(frequencies) > 5:
+            frequencies = frequencies[:4] + [frequencies[-1]]
 
         cms_depth = 2
         if task_count >= 2 or dataset_size >= 512:
