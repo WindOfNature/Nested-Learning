@@ -65,6 +65,9 @@ class MemoryBlock(nn.Module):
         eta = torch.sigmoid(self.meta(x_l2)) * 0.1
         alpha = torch.sigmoid(self.malpha(x_l2))
 
+        # Retention-gated memory consolidation
+        mem = alpha * hidden_state + (1.0 - alpha) * mem
+
         # Gated residual update on ORIGINAL x
         out = x + eta * mem
 
@@ -79,13 +82,13 @@ class MemoryBlock(nn.Module):
     def update(self, x: torch.Tensor, hidden_state: torch.Tensor, update: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         if not update:
             # Just forward pass
-            out, new_hidden, _, _, _ = self.forward(x, hidden_state)
+            out, new_hidden, _, _, _ = self(x, hidden_state)
             return out, new_hidden
 
         self.step_counter += 1
 
         # Forward pass with gradients
-        out, new_hidden, eta_tensor, alpha_tensor, mem = self.forward(x, hidden_state)
+        out, new_hidden, eta_tensor, alpha_tensor, mem = self(x, hidden_state)
 
         if self.step_counter % self.frequency == 0:
             # We need to perform optimization step.
@@ -104,24 +107,31 @@ class MemoryBlock(nn.Module):
                 mem_local = F.relu(layer(mem_local))
             # No output norm
 
-            # Reconstruct out locally
-            out_local = x_det + eta_tensor.detach() * mem_local
-            loss = F.mse_loss(out_local, x_det)
+            alpha_local = alpha_tensor.detach()
+            hidden_det = hidden_state.detach()
+            mem_local = alpha_local * hidden_det + (1.0 - alpha_local) * mem_local
+
+            # Reconstruct memory content locally (L2 regression)
+            # The memory block is trained to map normalized inputs to normalized targets.
+            loss = F.mse_loss(mem_local, x_l2)
 
             if self.replay_ratio > 0.0 and self.replay_buffer:
                 replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
                 if len(self.replay_buffer) >= replay_count:
-                    # Buffer stores samples (Tensor[Dim])
-                    replay_samples = random.sample(self.replay_buffer, replay_count)
-                    replay_batch = torch.stack(replay_samples, dim=0)
+                    for _ in range(max(1, self.replay_steps)):
+                        # Buffer stores samples (Tensor[Dim])
+                        replay_samples = random.sample(self.replay_buffer, replay_count)
+                        replay_batch = torch.stack(replay_samples, dim=0)
 
-                    # Replay forward pass with zero state (assuming independence)
-                    # Note: We need a new state tensor matching replay_batch size
-                    replay_zeros = torch.zeros(replay_batch.size(0), self.norm.gamma.size(0), device=replay_batch.device)
-
-                    # We only care about weight updates, so we ignore hidden state output
-                    replay_out, _, _, _, _ = self.forward(replay_batch, replay_zeros)
-                    loss = loss + F.mse_loss(replay_out, replay_batch)
+                        # Replay memory content regression using detached inputs.
+                        replay_ln = self.norm(replay_batch)
+                        replay_l2 = F.normalize(replay_ln, p=2, dim=-1)
+                        replay_mem = replay_l2
+                        for layer in self.layers:
+                            replay_mem = F.relu(layer(replay_mem))
+                        alpha_replay = torch.sigmoid(self.malpha(replay_l2)).detach()
+                        replay_mem = alpha_replay * torch.zeros_like(replay_mem) + (1.0 - alpha_replay) * replay_mem
+                        loss = loss + F.mse_loss(replay_mem, replay_l2)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -138,23 +148,7 @@ class MemoryBlock(nn.Module):
             self.optimizer.step(lr_override=eta_val, weight_decay_override=weight_decay)
 
             # Recompute memory content with updated weights to allow gradient flow
-            # The weights have changed, so we must re-run the forward pass for 'mem'
-            # to attach it to the graph correctly for downstream tasks.
-            # Note: We must re-compute normalization on x (attached)
-            x_ln = self.norm(x)
-            x_l2 = F.normalize(x_ln, p=2, dim=-1)
-
-            # Recompute eta using new norm (since norm was updated)
-            eta_new = torch.sigmoid(self.meta(x_l2)) * 0.1
-
-            mem_new = x_l2
-            for layer in self.layers:
-                mem_new = F.relu(layer(mem_new))
-            # No output norm
-
-            # Use new memory content
-            mem = mem_new
-            eta_tensor = eta_new
+            _, _, eta_tensor, _, mem = self(x, hidden_state)
 
         # Update replay buffer (detached)
         if self.replay_ratio > 0.0:

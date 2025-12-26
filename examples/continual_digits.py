@@ -38,6 +38,7 @@ def train_task(
     rng: np.random.Generator,
     chunk_size: int,
     memory_chunk_size: int,
+    task_id: int,
 ):
     model.train()
     global_step = 0
@@ -51,7 +52,7 @@ def train_task(
             batch_y = torch.tensor(y[batch_idx], device=device)
 
             # 1. Remember new data
-            model.remember(batch_x, batch_y)
+            model.remember(batch_x, batch_y, task_id=task_id)
 
             # 2. Sample Replay
             replay_data = model.sample_replay(batch_size // 2)
@@ -66,7 +67,7 @@ def train_task(
                 combined_y = batch_y
 
             # 4. Train on Combined Batch (Encoder, Decoder, Memory all learn from mixed)
-            logits = model.forward(combined_x, time=global_step)
+            logits = model.forward(combined_x, time=global_step, task_id=task_id)
             loss = torch.nn.functional.cross_entropy(logits, combined_y)
             optimizer.zero_grad()
             loss.backward()
@@ -78,23 +79,30 @@ def train_task(
             chunk_buffer.append(combined_x)
             if (step // batch_size + 1) % chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
-                model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
+                model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size, task_id=task_id)
                 chunk_buffer = []
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
         if chunk_buffer:
             chunk_x = torch.cat(chunk_buffer, dim=0)
-            model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
+            model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size, task_id=task_id)
 
 
-def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int, device: torch.device) -> float:
+def evaluate(
+    model: HOPEModel,
+    x: np.ndarray,
+    y: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+    task_id: int,
+) -> float:
     model.eval()
     correct = 0
     with torch.no_grad():
         for step in range(0, len(x), batch_size):
             batch_x = torch.tensor(x[step : step + batch_size], device=device)
             batch_y = torch.tensor(y[step : step + batch_size], device=device)
-            logits = model.forward(batch_x, time=step, update_memory=False)
+            logits = model.forward(batch_x, time=step, update_memory=False, task_id=task_id)
             preds = logits.argmax(dim=-1)
             correct += int((preds == batch_y).sum().item())
     return correct / len(x)
@@ -155,6 +163,7 @@ def main():
         input_dim=64,
         hidden_dim=128,
         output_dim=5,
+        task_count=2,
         frequencies=None if args.hope_levels else [1, 2, 4, 8],
         cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
         self_mod_depth=args.self_mod_depth,
@@ -189,8 +198,9 @@ def main():
         rng=rng,
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
+        task_id=0,
     )
-    acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
+    acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
     if args.optimizer_state_path:
         save_optimizer_state(optimizer, args.optimizer_state_path)
@@ -215,9 +225,10 @@ def main():
         rng=rng,
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
+        task_id=1,
     )
-    acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device)
-    acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
+    acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)
+    acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
     print(f"Task A accuracy before: {acc_a_before:.3f}")
     print(f"Task B accuracy: {acc_b:.3f}")
