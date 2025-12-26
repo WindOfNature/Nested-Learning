@@ -83,19 +83,21 @@ class MemoryBlock(nn.Module):
 
         if self.step_counter % self.frequency == 0:
             # We need to perform optimization step.
-            # DGD update requires gradients on parameters.
-            # We compute loss on the output vs input (reconstruction/prediction)
-            # The prompt implies cheap meta learning via eta in forward,
-            # but we also need to update the weights of the block.
 
-            # Note: We use the tensors from forward pass to preserve graph if needed,
-            # but DGD.step takes scalar overrides usually.
-            # However, prompt says "eta needs a direct gradient path" via out = x + eta * memory.
-            # That path is established in forward().
-            # Here we update the weights of the block using DGD.
+            # Loss for weight update (Local Reconstruction)
+            # We must NOT backprop to eta (Meta) OR x (Encoder) here.
+            # Local loss should only update the Memory Content weights (layers).
 
-            # Loss for weight update
-            loss = F.mse_loss(out, x) # Auto-encoder style? Or prediction?
+            x_det = x.detach()
+            # Recompute mem with detached input
+            mem_local = x_det
+            for layer in self.layers:
+                mem_local = F.relu(layer(mem_local))
+            mem_local = self.norm(mem_local)
+
+            # Reconstruct out locally
+            out_local = x_det + eta_tensor.detach() * mem_local
+            loss = F.mse_loss(out_local, x_det)
 
             if self.replay_ratio > 0.0 and self.replay_buffer:
                 replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
@@ -113,7 +115,7 @@ class MemoryBlock(nn.Module):
                     loss = loss + F.mse_loss(replay_out, replay_batch)
 
             self.optimizer.zero_grad()
-            loss.backward(retain_graph=True) # Retain graph because out is used downstream?
+            loss.backward()
 
             # Extract scalar values for optimizer (or mean)
             eta_val = eta_tensor.mean().item()
@@ -135,10 +137,16 @@ class MemoryBlock(nn.Module):
         out_detached = x + eta_tensor * mem.detach()
 
         # We also need to fix new_hidden if it depends on mem
+        # Fix Hidden State Detachment:
+        # The new hidden state must be detached from the optimization graph of the current step
+        # to prevent backprop through time from overwriting previous stable states (Online Learning).
         if self.decay > 0.0:
-            new_hidden_detached = (1.0 - self.decay) * hidden_state + self.decay * mem.detach()
+            new_hidden = (1.0 - self.decay) * hidden_state + self.decay * mem.detach()
         else:
-            new_hidden_detached = mem.detach()
+            new_hidden = mem.detach()
+
+        # Detach explicitly for safety (though mem.detach() handles most of it)
+        new_hidden_detached = new_hidden.detach()
 
         return out_detached, new_hidden_detached
 
@@ -183,7 +191,7 @@ class ContinuumMemorySystem(nn.Module):
         context = x
         new_states = []
         if states is None:
-            states = [torch.zeros(x.size(0), self.features, device=x.device) for _ in self.blocks]
+            states = [torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype) for _ in self.blocks]
 
         for block, state in zip(self.blocks, states):
             # Chain: context = block.forward(context) which is handled by update returning out
@@ -254,7 +262,7 @@ class NestedContinuumMemorySystem(nn.Module):
         for idx, (block, sub) in enumerate(zip(self.blocks, self.subsystems)):
             current_state_pair = states[idx]
             if current_state_pair is None:
-                block_state = torch.zeros(x.size(0), self.features, device=x.device)
+                block_state = torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype)
                 sub_states = None
             else:
                 block_state, sub_states = current_state_pair
@@ -321,7 +329,7 @@ class SequentialContinuumMemorySystem(nn.Module):
         context = x
         new_states = []
         if states is None:
-            states = [torch.zeros(x.size(0), self.features, device=x.device) for _ in self.blocks]
+            states = [torch.zeros(x.size(0), self.features, device=x.device, dtype=x.dtype) for _ in self.blocks]
 
         for block, state in zip(self.blocks, states):
             out, new_state = block.update(context, state, update=update)

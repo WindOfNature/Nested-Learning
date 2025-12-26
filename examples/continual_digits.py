@@ -40,14 +40,16 @@ def train_task(
     memory_chunk_size: int,
 ):
     model.train()
+    global_step = 0
     for epoch in range(epochs):
         indices = rng.permutation(len(x))
         chunk_buffer = []
         for step in range(0, len(indices), batch_size):
+            global_step += 1
             batch_idx = indices[step : step + batch_size]
             batch_x = torch.tensor(x[batch_idx], device=device)
             batch_y = torch.tensor(y[batch_idx], device=device)
-            logits = model.forward(batch_x, time=epoch * len(x) + step)
+            logits = model.forward(batch_x, time=global_step)
             loss = torch.nn.functional.cross_entropy(logits, batch_y)
             optimizer.zero_grad()
             loss.backward()
@@ -132,7 +134,7 @@ def main():
         input_dim=64,
         hidden_dim=128,
         output_dim=5,
-        frequencies=None if args.hope_levels else [1, 2, 4, 8, 64],
+        frequencies=None if args.hope_levels else [1, 2, 4, 8],
         cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
         self_mod_depth=args.self_mod_depth,
         heads=4,
