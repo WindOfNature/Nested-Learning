@@ -235,6 +235,7 @@ Task A accuracy after: 0.287
 Forgetting: 0.000
 ```
 * Accuracy is low because HOPE is not designed for vision task and this current implementation only uses a 128 dim, no CNN
+* and this was ran on only 200 max samples.
 ---
 
 ## Package Layout
