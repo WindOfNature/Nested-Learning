@@ -255,6 +255,16 @@ examples/
 
 ---
 
+## Credits
+
+```
+- NestedLearning.pdf (Ali Behrouz et al, and other Google Researcher) = Paper
+- OpenAI Codex (Model=GPT-5.2 Codex Max) = Codebase
+- @WindOfNature = Idea
+```
+
+---
+
 ## License
 
 Apache-2.0
