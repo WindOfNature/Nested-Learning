@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, List, Sequence
+from typing import Any, Deque, List, Sequence
 
 import torch
 import torch.nn as nn
@@ -27,7 +28,7 @@ class MemoryBlock(nn.Module):
         frequency: int,
         depth: int,
         decay: float = 0.0,
-        replay_ratio: float = 0.0,
+        replay_ratio: float = 0.25,
         replay_steps: int = 1,
         replay_buffer: int = 128,
     ):
@@ -98,12 +99,18 @@ class MemoryBlock(nn.Module):
 
             if self.replay_ratio > 0.0 and self.replay_buffer:
                 replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
-                # Replay logic might need to be careful about hidden states.
-                # For simplicity, we might skip hidden state for replay or use zeros/detached.
-                # But replay is mostly for weight update.
-                pass
-                # Replay is complex with hidden states.
-                # Given "Disable Replay Buffer: Set default replay_ratio=0.0", I will trust that.
+                if len(self.replay_buffer) >= replay_count:
+                    # Buffer stores samples (Tensor[Dim])
+                    replay_samples = random.sample(self.replay_buffer, replay_count)
+                    replay_batch = torch.stack(replay_samples, dim=0)
+
+                    # Replay forward pass with zero state (assuming independence)
+                    # Note: We need a new state tensor matching replay_batch size
+                    replay_zeros = torch.zeros(replay_batch.size(0), self.norm.gamma.size(0), device=replay_batch.device)
+
+                    # We only care about weight updates, so we ignore hidden state output
+                    replay_out, _, _, _, _ = self.forward(replay_batch, replay_zeros)
+                    loss = loss + F.mse_loss(replay_out, replay_batch)
 
             self.optimizer.zero_grad()
             loss.backward(retain_graph=True) # Retain graph because out is used downstream?
@@ -119,7 +126,8 @@ class MemoryBlock(nn.Module):
 
         # Update replay buffer (detached)
         if self.replay_ratio > 0.0:
-             self.replay_buffer.append(x.detach())
+             # Store samples, not batches
+             self.replay_buffer.extend(x.detach().unbind(0))
 
         # Return output with detached memory content to avoid in-place error during backprop
         # because 'layers' (used to compute mem) were updated in-place.
@@ -235,7 +243,7 @@ class NestedContinuumMemorySystem(nn.Module):
         )
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, states: List[any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[any]]:
+    def forward(self, x: torch.Tensor, time: int, states: List[Any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[Any]]:
         context = x
         new_states = []
         if states is None:
@@ -362,7 +370,7 @@ class HeadwiseContinuumMemorySystem(nn.Module):
         )
         self.features = features
 
-    def forward(self, x: torch.Tensor, time: int, states: List[any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[any]]:
+    def forward(self, x: torch.Tensor, time: int, states: List[Any] | None = None, update: bool = True) -> tuple[torch.Tensor, List[Any]]:
         chunks = []
         new_states = []
         if states is None:

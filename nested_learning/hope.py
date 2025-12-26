@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 import torch
 import torch.nn as nn
@@ -21,7 +21,7 @@ from .memory import (
 @dataclass
 class HopeState:
     time: int
-    memory: any  # Changed from torch.Tensor to any to support list of states
+    memory: List[Any] | None  # Supports nested list of states
 
 
 class HOPEModel(nn.Module):
@@ -212,11 +212,31 @@ class HOPEModel(nn.Module):
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
 
         # Update CMS
-        # We need to pass states? If update_chunk is offline updates, maybe we don't care about state continuity?
-        # But CMS needs state.
-        # We pass None to let CMS initialize states matching the chunk size (e.g. 128).
-        # We do NOT update self.state.memory because that tracks the online stream (batch size 32).
-        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=None, update=True)
+        # Use current state if batch dimension matches (e.g. batch training), else reset (e.g. inference/chunking).
+        current_states = self.state.memory
+
+        # Check batch dimension match using helper from forward (need to move helper or redefine)
+        def check_batch_dim_local(states, batch_size):
+            if states is None: return False
+            if isinstance(states, (list, tuple)):
+                if not states: return True
+                return check_batch_dim_local(states[0], batch_size)
+            if isinstance(states, torch.Tensor):
+                return states.size(0) == batch_size
+            return True
+
+        if current_states is not None and check_batch_dim_local(current_states, encoded.size(0)):
+            # Detach states to prevent infinite history, but allow state continuity
+            # We must handle nested structure (list/tuple) for detachment
+            def detach_recursive(s):
+                if isinstance(s, torch.Tensor): return s.detach()
+                if isinstance(s, (list, tuple)): return [detach_recursive(i) for i in s]
+                return s
+            use_states = detach_recursive(current_states)
+        else:
+            use_states = None
+
+        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=use_states, update=True)
 
         if self.nested_flow is not None:
             encoded = self.nested_flow.forward(encoded, time=self.state.time, update=True)
