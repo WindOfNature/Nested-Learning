@@ -67,6 +67,8 @@ model = HOPEModel.from_preset(
     preset="balanced",
     dataset_size=10_000,
     task_count=4,
+    frequencies=[1, 2, 4, 8],
+    cms_depth=2,
     backbone="titans",
 )
 
@@ -87,6 +89,8 @@ model = HOPEModel.from_preset(
     preset="balanced",
     dataset_size=10_000,
     task_count=4,
+    frequencies=[1, 2, 4, 8],
+    cms_depth=2,
     backbone="attention",
 )
 
@@ -98,7 +102,11 @@ logits = model(x, time=0)
 
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
-  --max-samples 500
+  --max-samples 500 \
+  --cms-frequencies 1,2,4,8 \
+  --cms-depth 2 \
+  --cms-chunk-size 4 \
+  --cms-memory-chunk-size 4
 ```
 
 ### D) CMS multi-level frequencies
@@ -179,6 +187,7 @@ HOPEModel(
     output_dim: int,
     task_count: int | None = None,
     frequencies: list[int] | None,
+    cms_depth: int = 2,
     cms_variant: str = "nested",  # nested | sequential | headwise | chain
     self_mod_depth: int = 2,
     heads: int = 4,
@@ -191,7 +200,7 @@ HOPEModel(
     nested_hidden: int = 128,
     memory_decay: float = 0.0,
     replay_ratio: float = 0.0,
-    replay_steps: int = 1,
+    replay_steps: int = 0,
     replay_buffer: int = 128,
     use_conv: bool = True,
     conv_kernel: int = 3,
@@ -228,6 +237,19 @@ not required for a solid baseline.
 If you don’t want to tune hyperparameters, use `preset="balanced"` with
 `auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, and
 memory decay based on dataset size and task count.
+
+> Note: Presets default to **no replay**. Replay is only active if you pass
+> non-zero `replay_ratio` and `replay_weight` in your training code.
+
+### CMS Hyperparameters (required for presets)
+
+`frequencies` defines the CMS update rates (Eq. 70–71 in the paper). `cms_depth`
+controls the per-level MLP depth inside each memory block. In the digits example
+we pass `--cms-frequencies` and `--cms-depth` explicitly, and CMS chunk sizes
+are configured via `--cms-chunk-size` / `--cms-memory-chunk-size`.
+
+`hope_levels` + `lowest_frequency` can still be used as a convenience to generate
+frequencies, but presets expect explicit `frequencies` for CMS configuration.
 ---
 
 ## Optimizer State Persistence (Continual Learning)
@@ -246,12 +268,12 @@ load_optimizer_state(optimizer, "optim_state.pt")
 Example run (as in the paper’s continual-learning style setup):
 
 ```
-Task A accuracy before: 0.652
-Task B accuracy: 0.922
-Task A accuracy after: 0.873
-Forgetting: -0.221
+Task A accuracy before: 0.558
+Task B accuracy: 0.883
+Task A accuracy after: 0.680
+Forgetting: -0.122
 ```
-* Accuracy is shown for the default preset + auto-scale settings using 500 max samples.
+* Accuracy is shown for the default preset + auto-scale settings using 500 max samples (replay disabled).
 ---
 
 ## Package Layout

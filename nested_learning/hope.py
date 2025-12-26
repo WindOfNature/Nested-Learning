@@ -33,33 +33,27 @@ class HOPEModel(nn.Module):
     def preset_config(preset: str) -> dict[str, Any]:
         if preset == "fast_adapt":
             return {
-                "hope_levels": 3,
-                "lowest_frequency": 1,
                 "memory_decay": 0.015,
-                "replay_ratio": 0.35,
-                "replay_steps": 1,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
                 "self_mod_depth": 4,
                 "nested_depth": 2,
                 "nested_hidden": 128,
             }
         if preset == "high_retention":
             return {
-                "hope_levels": 4,
-                "lowest_frequency": 1,
                 "memory_decay": 0.01,
-                "replay_ratio": 0.5,
-                "replay_steps": 2,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
                 "self_mod_depth": 3,
                 "nested_depth": 2,
                 "nested_hidden": 128,
             }
         if preset == "balanced":
             return {
-                "hope_levels": 3,
-                "lowest_frequency": 1,
                 "memory_decay": 0.01,
-                "replay_ratio": 0.4,
-                "replay_steps": 1,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
                 "self_mod_depth": 3,
                 "nested_depth": 2,
                 "nested_hidden": 128,
@@ -96,6 +90,8 @@ class HOPEModel(nn.Module):
         if auto_scale:
             config.update(cls.auto_scale_config(dataset_size, task_count))
         config.update(overrides)
+        if "frequencies" not in config and "hope_levels" not in config:
+            raise ValueError("frequencies (or hope_levels) must be provided when using presets")
         return cls(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -111,6 +107,7 @@ class HOPEModel(nn.Module):
         output_dim: int,
         task_count: int | None = None,
         frequencies: List[int] | None = None,
+        cms_depth: int = 2,
         cms_variant: str = "nested",
         self_mod_depth: int = 2,
         heads: int = 4,
@@ -148,6 +145,7 @@ class HOPEModel(nn.Module):
             self.cms = NestedContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -157,6 +155,7 @@ class HOPEModel(nn.Module):
             self.cms = SequentialContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -167,6 +166,7 @@ class HOPEModel(nn.Module):
                 hidden_dim,
                 frequencies=frequencies,
                 heads=heads,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -176,6 +176,7 @@ class HOPEModel(nn.Module):
             self.cms = ContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,

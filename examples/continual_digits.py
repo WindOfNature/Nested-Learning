@@ -30,8 +30,6 @@ def prepare_tasks():
 def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) -> argparse.Namespace:
     if args.preset != "custom":
         preset_config = HOPEModel.preset_config(args.preset)
-        args.hope_levels = preset_config["hope_levels"]
-        args.lowest_frequency = preset_config["lowest_frequency"]
         args.memory_decay = preset_config["memory_decay"]
         args.replay_ratio = preset_config["replay_ratio"]
         args.replay_steps = preset_config["replay_steps"]
@@ -42,11 +40,14 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
     if args.auto_scale:
         auto_config = HOPEModel.auto_scale_config(dataset_size, task_count)
         args.replay_buffer = auto_config.get("replay_buffer", args.replay_buffer)
-        args.replay_ratio = auto_config.get("replay_ratio", args.replay_ratio)
+        if args.replay_ratio > 0.0:
+            args.replay_ratio = auto_config.get("replay_ratio", args.replay_ratio)
         args.memory_decay = auto_config.get("memory_decay", args.memory_decay)
-        args.chunk_size = max(2, int(np.sqrt(dataset_size) // 8))
-        args.memory_chunk_size = max(args.chunk_size, int(np.sqrt(dataset_size) // 6))
-        args.replay_weight = min(0.3, 0.05 + 0.02 * task_count)
+        if args.backbone == "titans":
+            args.cms_chunk_size = max(2, int(np.sqrt(dataset_size) // 8))
+            args.cms_memory_chunk_size = max(args.cms_chunk_size, int(np.sqrt(dataset_size) // 6))
+        if args.replay_weight > 0.0:
+            args.replay_weight = min(0.3, 0.05 + 0.02 * task_count)
         if args.task_b_epochs is None:
             args.task_b_epochs = max(args.epochs, 10)
 
@@ -62,10 +63,11 @@ def train_task(
     batch_size: int,
     device: torch.device,
     rng: np.random.Generator,
-    chunk_size: int,
-    memory_chunk_size: int,
+    cms_chunk_size: int,
+    cms_memory_chunk_size: int,
     task_id: int,
     replay_weight: float,
+    replay_ratio: float,
 ):
     model.train()
     global_step = 0
@@ -82,7 +84,9 @@ def train_task(
             model.remember(batch_x, batch_y, task_id=task_id)
 
             # 2. Sample Replay
-            replay_data = model.sample_replay(batch_size // 2)
+            replay_data = None
+            if replay_ratio > 0.0 and replay_weight > 0.0:
+                replay_data = model.sample_replay(batch_size // 2)
 
             # 3. Train with task-weighted replay
             if replay_data is not None:
@@ -116,15 +120,25 @@ def train_task(
             # 5. Update Chunk (CMS Maintenance on Mixed Data)
             # We use the combined batch for chunk updates to ensure consistency
             chunk_buffer.append(combined_x)
-            if (step // batch_size + 1) % chunk_size == 0:
+            if (step // batch_size + 1) % cms_chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
-                model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size, task_id=task_id)
+                model.update_chunk(
+                    chunk_x,
+                    chunk_size=cms_chunk_size,
+                    memory_chunk_size=cms_memory_chunk_size,
+                    task_id=task_id,
+                )
                 chunk_buffer = []
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
         if chunk_buffer:
             chunk_x = torch.cat(chunk_buffer, dim=0)
-            model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size, task_id=task_id)
+            model.update_chunk(
+                chunk_x,
+                chunk_size=cms_chunk_size,
+                memory_chunk_size=cms_memory_chunk_size,
+                task_id=task_id,
+            )
 
 
 def evaluate(
@@ -156,8 +170,10 @@ def main():
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--chunk-size", type=int, default=4)
-    parser.add_argument("--memory-chunk-size", type=int, default=4)
+    parser.add_argument("--cms-frequencies", type=str, required=True)
+    parser.add_argument("--cms-depth", type=int, required=True)
+    parser.add_argument("--cms-chunk-size", type=int, required=True)
+    parser.add_argument("--cms-memory-chunk-size", type=int, required=True)
     parser.add_argument("--preset", type=str, default="balanced", choices=["balanced", "fast_adapt", "high_retention", "custom"])
     parser.add_argument("--auto-scale", dest="auto_scale", action="store_true", default=True)
     parser.add_argument("--no-auto-scale", dest="auto_scale", action="store_false")
@@ -165,15 +181,13 @@ def main():
     parser.add_argument("--nested-depth", type=int, default=2)
     parser.add_argument("--nested-hidden", type=int, default=128)
     parser.add_argument("--memory-decay", type=float, default=0.01)
-    parser.add_argument("--replay-ratio", type=float, default=0.5)
+    parser.add_argument("--replay-ratio", type=float, default=0.0)
     parser.add_argument("--replay-steps", type=int, default=1)
     parser.add_argument("--replay-buffer", type=int, default=2000)
-    parser.add_argument("--replay-weight", type=float, default=0.1)
+    parser.add_argument("--replay-weight", type=float, default=0.0)
     parser.add_argument("--self-mod-depth", type=int, default=3)
     parser.add_argument("--self-mod-query-static", action="store_true")
     parser.add_argument("--backbone", type=str, default="titans", choices=["titans", "attention"])
-    parser.add_argument("--hope-levels", type=int, default=0)
-    parser.add_argument("--lowest-frequency", type=int, default=1)
     parser.add_argument("--freeze-k", action="store_true")
     parser.add_argument("--freeze-v", action="store_true")
     parser.add_argument("--freeze-q", action="store_true")
@@ -184,6 +198,7 @@ def main():
     parser.add_argument("--optimizer-state-path", type=str, default="")
     parser.add_argument("--reset-optimizer-between-tasks", action="store_true")
     args = parser.parse_args()
+    args.cms_frequencies = [int(item.strip()) for item in args.cms_frequencies.split(",") if item.strip()]
 
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
@@ -217,6 +232,8 @@ def main():
             task_count=2,
             auto_scale=args.auto_scale,
             cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
+            frequencies=args.cms_frequencies,
+            cms_depth=args.cms_depth,
             replay_steps=args.replay_steps,
             replay_buffer=args.replay_buffer,
             self_mod_query_static=args.self_mod_query_static,
@@ -230,7 +247,8 @@ def main():
             hidden_dim=128,
             output_dim=5,
             task_count=2,
-            frequencies=None if args.hope_levels else [1, 2, 4, 8],
+            frequencies=args.cms_frequencies,
+            cms_depth=args.cms_depth,
             cms_variant="nested" if args.cms_variant == "chain" else args.cms_variant,
             self_mod_depth=args.self_mod_depth,
             heads=4,
@@ -243,8 +261,6 @@ def main():
             self_mod_query_static=args.self_mod_query_static,
             self_mod_projection_mask=projection_mask,
             backbone=args.backbone,
-            hope_levels=args.hope_levels or None,
-            lowest_frequency=args.lowest_frequency,
         ).to(device)
     base_optimizer = torch.optim.AdamW
     if args.steered_optim:
@@ -265,10 +281,11 @@ def main():
         batch_size=args.batch_size,
         device=device,
         rng=rng,
-        chunk_size=args.chunk_size,
-        memory_chunk_size=args.memory_chunk_size,
+        cms_chunk_size=args.cms_chunk_size,
+        cms_memory_chunk_size=args.cms_memory_chunk_size,
         task_id=0,
         replay_weight=args.replay_weight,
+        replay_ratio=args.replay_ratio,
     )
     acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
@@ -293,10 +310,11 @@ def main():
         batch_size=args.batch_size,
         device=device,
         rng=rng,
-        chunk_size=args.chunk_size,
-        memory_chunk_size=args.memory_chunk_size,
+        cms_chunk_size=args.cms_chunk_size,
+        cms_memory_chunk_size=args.cms_memory_chunk_size,
         task_id=1,
         replay_weight=args.replay_weight,
+        replay_ratio=args.replay_ratio,
     )
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
