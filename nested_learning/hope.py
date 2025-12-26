@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, List
 
@@ -113,6 +114,11 @@ class HOPEModel(nn.Module):
         self.decoder = Linear(hidden_dim, output_dim)
         self.norm = LayerNorm(hidden_dim)
         self.state = HopeState(time=0, memory=None)
+
+        self.replay_ratio = replay_ratio
+        self.replay_steps = replay_steps
+        self.raw_replay_buffer = deque(maxlen=replay_buffer)
+
         self._last_context: torch.Tensor | None = None
         self._last_logits: torch.Tensor | None = None
 
@@ -202,7 +208,23 @@ class HOPEModel(nn.Module):
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
 
-        encoded = F.relu(self.encoder(x))
+        # Step A: Store raw experience (detached from graph)
+        # Assuming x is raw input
+        self.raw_replay_buffer.extend(x.detach().unbind(0))
+
+        x_combined = x
+
+        # Step B & C: Sample and Mix
+        if self.replay_ratio > 0.0 and len(self.raw_replay_buffer) > 0:
+            replay_count = max(1, int(self.replay_ratio * x.size(0)))
+            if len(self.raw_replay_buffer) >= replay_count:
+                import random
+                replay_samples = random.sample(self.raw_replay_buffer, replay_count)
+                replay_batch = torch.stack(replay_samples, dim=0)
+                x_combined = torch.cat([x, replay_batch], dim=0)
+
+        # Step D: Encode Combined Batch
+        encoded = F.relu(self.encoder(x_combined))
         if self.pre_norm is not None:
             encoded = self.pre_norm(encoded)
         if self.conv is not None:
@@ -211,32 +233,10 @@ class HOPEModel(nn.Module):
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
 
-        # Update CMS
-        # Use current state if batch dimension matches (e.g. batch training), else reset (e.g. inference/chunking).
-        current_states = self.state.memory
-
-        # Check batch dimension match using helper from forward (need to move helper or redefine)
-        def check_batch_dim_local(states, batch_size):
-            if states is None: return False
-            if isinstance(states, (list, tuple)):
-                if not states: return True
-                return check_batch_dim_local(states[0], batch_size)
-            if isinstance(states, torch.Tensor):
-                return states.size(0) == batch_size
-            return True
-
-        if current_states is not None and check_batch_dim_local(current_states, encoded.size(0)):
-            # Detach states to prevent infinite history, but allow state continuity
-            # We must handle nested structure (list/tuple) for detachment
-            def detach_recursive(s):
-                if isinstance(s, torch.Tensor): return s.detach()
-                if isinstance(s, (list, tuple)): return [detach_recursive(i) for i in s]
-                return s
-            use_states = detach_recursive(current_states)
-        else:
-            use_states = None
-
-        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=use_states, update=True)
+        # Step E: Update CMS
+        # We pass update=True to allow CMS to learn from this mixed batch.
+        # State is reset (None) for mixed/offline update.
+        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=None, update=True)
 
         if self.nested_flow is not None:
             encoded = self.nested_flow.forward(encoded, time=self.state.time, update=True)
