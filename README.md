@@ -15,7 +15,7 @@ and may contain inaccuracies/imcomplete relative to the paper. Issues and PRs ar
 
 ## Highlights
 
-- **Self-Referential Titans** with adaptive **k, v, q, η, α, memory** modules.
+- **Self-Referential Titans** with adaptive **k, v, η, α, memory** modules (static **q** by default).
 - **Hope-Attention** variant (Titans swapped for softmax attention).
 - **Nested Context-Flow** for explicit multi-level optimization.
 - **Continuum Memory System (CMS)** with multi-timescale update, decay, and replay.
@@ -136,7 +136,7 @@ PYTHONPATH=. python examples/continual_digits.py \
 ## Architecture Overview
 
 ### Self-Referential Titans
-Titans generate **k, v, q, η, α** from context and self-modify via memory modules.
+Titans generate **k, v, η, α** (and optionally adaptive **q**) from context and self-modify via memory modules.
 Each memory module follows the 2-layer structure from the paper (Eqs. 89–91):
 
 ```
@@ -146,6 +146,10 @@ M□(x) = x + W□,1 σ(W□,2 x)
 Chunk-wise updates follow NL dual-form scheduling (Sec. 8.2):
 - Signals for a chunk are computed *before* updates.
 - Projection updates and memory updates can use different chunk sizes.
+Keys/queries are L2-normalized by default, and local convolutions use a window size of 4.
+
+### Hope
+Hope applies the self-modifying Titans (or attention variant) before the CMS chain to match Figure 5 and Eq. 94–97.
 
 ### Hope-Attention
 Hope-Attention replaces the Titans block with a softmax attention module.
@@ -189,7 +193,8 @@ HOPEModel(
     cms_variant: str = "nested",  # nested | sequential | headwise | chain
     self_mod_depth: int = 2,
     heads: int = 4,
-    self_mod_query_static: bool = False,
+    self_mod_query_static: bool = True,
+    self_mod_normalize_qk: bool = True,
     self_mod_projection_mask: tuple[bool, bool, bool, bool, bool] | None = None,
     backbone: str = "titans",  # titans | attention
     hope_levels: int | None = None,
@@ -201,11 +206,27 @@ HOPEModel(
     replay_steps: int = 1,
     replay_buffer: int = 128,
     use_conv: bool = True,
-    conv_kernel: int = 3,
+    conv_kernel: int = 4,
     use_pre_norm: bool = True,
     use_post_norm: bool = True,
 )
 ```
+
+- **input_dim / hidden_dim / output_dim**: input feature size, latent model width, and logits dimension.
+- **frequencies**: explicit CMS update rates per level; if omitted, `hope_levels`/`lowest_frequency` build a power-of-two schedule.
+- **cms_variant**: `nested`, `sequential`, `headwise`, or `chain` (alias for `nested`) memory topology.
+- **self_mod_depth**: number of self-referential Titans layers (depth of in-context self-modification).
+- **heads**: attention heads for Hope-Attention and headwise CMS.
+- **self_mod_query_static**: keep `q` non-adaptive (default `True` per Eq. 83); set `False` to allow adaptive `q`.
+- **self_mod_normalize_qk**: L2-normalize `q` and `k` for stability (default `True`).
+- **self_mod_projection_mask**: `(k, v, q, eta, alpha)` booleans to freeze individual projection updates.
+- **backbone**: `titans` (self-modifying) or `attention` (softmax).
+- **hope_levels / lowest_frequency**: build a CMS schedule of `hope_levels` frequencies starting at `lowest_frequency`.
+- **nested_depth / nested_hidden**: optional nested context-flow depth and width.
+- **memory_decay**: exponential consolidation into long-term CMS state.
+- **replay_ratio / replay_steps / replay_buffer**: CMS replay sampling parameters.
+- **use_conv / conv_kernel**: local convolution toggle and kernel size (default `4`); only applied for sequence inputs.
+- **use_pre_norm / use_post_norm**: apply LayerNorm before/after main block.
 
 - `forward(x, time, update_memory=True)`
 - `update_chunk(x, chunk_size=None, memory_chunk_size=None)`
@@ -222,6 +243,57 @@ save_optimizer_state(optimizer, "optim_state.pt")
 load_optimizer_state(optimizer, "optim_state.pt")
 ```
 
+## Optimizers
+
+### `DGD`
+Delta Gradient Descent with associative-memory updates used for self-modifying modules.
+
+### `GGD`
+Generalized Gradient Descent with self-referential value generation and optional retention.
+
+### `GM`
+Generalized Momentum with self-referential momentum state.
+
+### `ContextSteeredOptimizer`
+Wraps a base optimizer and preconditions gradients using associative-memory state.
+
+```python
+from nested_learning.torch_optim import ContextSteeredOptimizer, SteeredOptimizerConfig
+
+config = SteeredOptimizerConfig(
+    memory_beta=0.9,
+    variance_beta=0.999,
+    alpha=0.5,
+    eps=1e-8,
+    precondition="outer",  # none | adagrad | adam | outer
+    weight_decay=1e-3,
+)
+optimizer = ContextSteeredOptimizer(model.parameters(), torch.optim.AdamW, config=config, lr=1e-3)
+```
+
+## Memory Systems
+
+### CMS variants
+- **ContinuumMemorySystem**: chain of MLP memory blocks with different update frequencies.
+- **NestedContinuumMemorySystem**: fully nested CMS where each block owns a sub-CMS.
+- **SequentialContinuumMemorySystem**: sequential CMS with explicit normalization.
+- **HeadwiseContinuumMemorySystem**: parallel head-wise CMS streams.
+
+Each memory block uses an MLP stack and can consolidate (`decay`) plus replay (`replay_ratio`, `replay_steps`, `replay_buffer`).
+
+## CMS Initialization from Pre-trained MLP Blocks
+
+```python
+from nested_learning.hope import HOPEModel
+
+model = HOPEModel(input_dim=64, hidden_dim=128, output_dim=10, frequencies=[1, 4, 16])
+model.load_cms_pretrained([
+    [mlp_layer1, mlp_layer2],
+    [mlp_layer1, mlp_layer2],
+    [mlp_layer1, mlp_layer2],
+])
+```
+
 ---
 
 ## Proof of Concept (Digits)
@@ -234,8 +306,7 @@ Task B accuracy: 0.228
 Task A accuracy after: 0.287
 Forgetting: 0.000
 ```
-* Accuracy is low because HOPE is not designed for vision task and this current implementation only uses a 128 dim, no CNN
-* and this was ran on only 200 max samples.
+* Accuracy is still modest because HOPE is not designed for vision tasks; the example now uses a lightweight CNN feature extractor and the full digits dataset by default.
 ---
 
 ## Package Layout

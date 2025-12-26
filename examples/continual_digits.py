@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
 
@@ -27,8 +29,23 @@ def prepare_tasks():
     return task_a, task_b
 
 
+class DigitCNN(nn.Module):
+    def __init__(self, output_dim: int = 64):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
+        self.fc = nn.Linear(32 * 8 * 8, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.flatten(1)
+        return self.fc(x)
+
+
 def train_task(
     model: HOPEModel,
+    feature_extractor: nn.Module,
     optimizer: torch.optim.Optimizer,
     x: np.ndarray,
     y: np.ndarray,
@@ -40,19 +57,22 @@ def train_task(
     memory_chunk_size: int,
 ):
     model.train()
+    feature_extractor.train()
     for epoch in range(epochs):
         indices = rng.permutation(len(x))
         chunk_buffer = []
         for step in range(0, len(indices), batch_size):
             batch_idx = indices[step : step + batch_size]
             batch_x = torch.tensor(x[batch_idx], device=device)
+            batch_x = batch_x.view(-1, 1, 8, 8)
+            features = feature_extractor(batch_x)
             batch_y = torch.tensor(y[batch_idx], device=device)
-            logits = model.forward(batch_x, time=epoch * len(x) + step)
+            logits = model.forward(features, time=epoch * len(x) + step)
             loss = torch.nn.functional.cross_entropy(logits, batch_y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            chunk_buffer.append(batch_x)
+            chunk_buffer.append(features.detach())
             if (step // batch_size + 1) % chunk_size == 0:
                 chunk_x = torch.cat(chunk_buffer, dim=0)
                 model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
@@ -64,14 +84,24 @@ def train_task(
             model.update_chunk(chunk_x, chunk_size=chunk_size, memory_chunk_size=memory_chunk_size)
 
 
-def evaluate(model: HOPEModel, x: np.ndarray, y: np.ndarray, batch_size: int, device: torch.device) -> float:
+def evaluate(
+    model: HOPEModel,
+    feature_extractor: nn.Module,
+    x: np.ndarray,
+    y: np.ndarray,
+    batch_size: int,
+    device: torch.device,
+) -> float:
     model.eval()
+    feature_extractor.eval()
     correct = 0
     with torch.no_grad():
         for step in range(0, len(x), batch_size):
             batch_x = torch.tensor(x[step : step + batch_size], device=device)
+            batch_x = batch_x.view(-1, 1, 8, 8)
+            features = feature_extractor(batch_x)
             batch_y = torch.tensor(y[step : step + batch_size], device=device)
-            logits = model.forward(batch_x, time=step, update_memory=False)
+            logits = model.forward(features, time=step, update_memory=False)
             preds = logits.argmax(dim=-1)
             correct += int((preds == batch_y).sum().item())
     return correct / len(x)
@@ -81,7 +111,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--max-samples", type=int, default=500)
+    parser.add_argument("--max-samples", type=int, default=1797)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--chunk-size", type=int, default=4)
@@ -117,8 +147,9 @@ def main():
     (xa, ya), (xb, yb) = prepare_tasks()
     xa_train, xa_test, ya_train, ya_test = train_test_split(xa, ya, test_size=0.2, random_state=42)
     xb_train, xb_test, yb_train, yb_test = train_test_split(xb, yb, test_size=0.2, random_state=42)
-    xa_train, ya_train = xa_train[: args.max_samples], ya_train[: args.max_samples]
-    xb_train, yb_train = xb_train[: args.max_samples], yb_train[: args.max_samples]
+    if args.max_samples > 0:
+        xa_train, ya_train = xa_train[: args.max_samples], ya_train[: args.max_samples]
+        xb_train, yb_train = xb_train[: args.max_samples], yb_train[: args.max_samples]
 
     projection_mask = (
         not args.freeze_k,
@@ -128,6 +159,7 @@ def main():
         not args.freeze_alpha,
     )
 
+    feature_extractor = DigitCNN(output_dim=64).to(device)
     model = HOPEModel(
         input_dim=64,
         hidden_dim=128,
@@ -149,14 +181,16 @@ def main():
         lowest_frequency=args.lowest_frequency,
     ).to(device)
     base_optimizer = torch.optim.AdamW
+    params = itertools.chain(feature_extractor.parameters(), model.parameters())
     if args.steered_optim:
         config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
-        optimizer = ContextSteeredOptimizer(model.parameters(), base_optimizer, config=config, lr=1e-3)
+        optimizer = ContextSteeredOptimizer(params, base_optimizer, config=config, lr=1e-3)
     else:
-        optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = base_optimizer(params, lr=1e-3, weight_decay=1e-3)
 
     train_task(
         model,
+        feature_extractor,
         optimizer,
         xa_train,
         ya_train,
@@ -167,7 +201,7 @@ def main():
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
     )
-    acc_a_before = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
+    acc_a_before = evaluate(model, feature_extractor, xa_test, ya_test, batch_size=args.batch_size, device=device)
 
     if args.optimizer_state_path:
         save_optimizer_state(optimizer, args.optimizer_state_path)
@@ -177,12 +211,13 @@ def main():
         else:
             if args.steered_optim:
                 config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
-                optimizer = ContextSteeredOptimizer(model.parameters(), base_optimizer, config=config, lr=1e-3)
+                optimizer = ContextSteeredOptimizer(params, base_optimizer, config=config, lr=1e-3)
             else:
-                optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
+                optimizer = base_optimizer(params, lr=1e-3, weight_decay=1e-3)
 
     train_task(
         model,
+        feature_extractor,
         optimizer,
         xb_train,
         yb_train,
@@ -193,8 +228,8 @@ def main():
         chunk_size=args.chunk_size,
         memory_chunk_size=args.memory_chunk_size,
     )
-    acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device)
-    acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device)
+    acc_b = evaluate(model, feature_extractor, xb_test, yb_test, batch_size=args.batch_size, device=device)
+    acc_a_after = evaluate(model, feature_extractor, xa_test, ya_test, batch_size=args.batch_size, device=device)
 
     print(f"Task A accuracy before: {acc_a_before:.3f}")
     print(f"Task B accuracy: {acc_b:.3f}")

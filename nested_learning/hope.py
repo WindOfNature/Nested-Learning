@@ -34,7 +34,8 @@ class HOPEModel(nn.Module):
         cms_variant: str = "nested",
         self_mod_depth: int = 2,
         heads: int = 4,
-        self_mod_query_static: bool = False,
+        self_mod_query_static: bool = True,
+        self_mod_normalize_qk: bool = True,
         self_mod_projection_mask: tuple[bool, bool, bool, bool, bool] | None = None,
         backbone: str = "titans",
         hope_levels: int | None = None,
@@ -46,7 +47,7 @@ class HOPEModel(nn.Module):
         replay_steps: int = 1,
         replay_buffer: int = 128,
         use_conv: bool = True,
-        conv_kernel: int = 3,
+        conv_kernel: int = 4,
         use_pre_norm: bool = True,
         use_post_norm: bool = True,
     ):
@@ -105,7 +106,12 @@ class HOPEModel(nn.Module):
         self.backbone = backbone
         self.self_mod_projection_mask = self_mod_projection_mask
         self.self_mod = (
-            SelfModifyingStack(hidden_dim, depth=self_mod_depth, query_static=self_mod_query_static)
+            SelfModifyingStack(
+                hidden_dim,
+                depth=self_mod_depth,
+                query_static=self_mod_query_static,
+                normalize_qk=self_mod_normalize_qk,
+            )
             if backbone == "titans"
             else None
         )
@@ -122,23 +128,24 @@ class HOPEModel(nn.Module):
             encoded = self.pre_norm(encoded)
         if self.conv is not None:
             if encoded.dim() == 2:
-                encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+                # Skip local convolution for non-sequence inputs to avoid length expansion.
+                pass
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
-        memory_context = self.cms.forward(encoded, time, update=update_memory)
+        if self.backbone == "attention":
+            modulated = self.attention(encoded)
+        else:
+            modulated = self.self_mod(encoded)
+        memory_context = self.cms.forward(modulated, time, update=update_memory)
         if self.nested_flow is not None:
             memory_context = self.nested_flow.forward(memory_context, time, update=update_memory)
-        if self.backbone == "attention":
-            modulated = self.attention(memory_context)
-        else:
-            modulated = self.self_mod(memory_context)
-        normed = self.norm(modulated)
+        normed = self.norm(memory_context)
         if self.post_norm is not None:
             normed = self.post_norm(normed)
         logits = self.decoder(normed)
         if update_memory:
             self.state = HopeState(time=time, memory=memory_context.detach())
-            self._last_context = memory_context
+            self._last_context = modulated
             logits.retain_grad()
             self._last_logits = logits
         return logits
@@ -154,11 +161,9 @@ class HOPEModel(nn.Module):
             encoded = self.pre_norm(encoded)
         if self.conv is not None:
             if encoded.dim() == 2:
-                encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+                pass
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
-        if self.nested_flow is not None:
-            encoded = self.nested_flow.forward(encoded, time=self.state.time, update=True)
         if self.self_mod is not None:
             self.self_mod.update_chunk(
                 encoded,
@@ -166,6 +171,13 @@ class HOPEModel(nn.Module):
                 memory_chunk_size=memory_chunk_size,
                 projection_mask=self.self_mod_projection_mask,
             )
+        if self.backbone == "attention":
+            modulated = self.attention(encoded)
+        else:
+            modulated = self.self_mod(encoded) if self.self_mod is not None else encoded
+        cms_context = self.cms.forward(modulated, time=self.state.time, update=True)
+        if self.nested_flow is not None:
+            _ = self.nested_flow.forward(cms_context, time=self.state.time, update=True)
 
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:
@@ -175,3 +187,6 @@ class HOPEModel(nn.Module):
 
     def reset(self):
         self.state = HopeState(time=0, memory=torch.zeros_like(self.state.memory))
+
+    def load_cms_pretrained(self, blocks: list[list[object]]):
+        self.cms.load_pretrained_blocks(blocks)

@@ -70,11 +70,11 @@ class MLP(nn.Module):
 
 
 class MemoryMLP(nn.Module):
-    """Memory module M□(·) = (·) + W1 σ(W2 (·))."""
+    """Memory module M□(·) = (·) + W1 σ(W2 (·)) with NL-style updates."""
 
     def __init__(self, features: int, hidden_features: int | None = None):
         super().__init__()
-        hidden = hidden_features or features * 2
+        hidden = hidden_features or features
         self.fc1 = Linear(features, hidden)
         self.fc2 = Linear(hidden, features)
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
@@ -89,6 +89,29 @@ class MemoryMLP(nn.Module):
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step(lr_override=lr, weight_decay_override=weight_decay)
+
+    @torch.no_grad()
+    def self_mod_update(self, keys: torch.Tensor, targets: torch.Tensor, eta: float, alpha: float):
+        """Self-modifying update rule aligned with Eq. 88-93 for matrix-like memories."""
+        if keys.dim() == 1:
+            keys = keys.unsqueeze(0)
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(0)
+        with torch.enable_grad():
+            preds = self.forward(keys)
+            loss = F.mse_loss(preds, targets)
+            self.optimizer.zero_grad()
+            loss.backward()
+
+        k_cov = keys.t() @ keys / max(1, keys.shape[0])
+        for param in self.parameters():
+            if param.grad is None:
+                continue
+            update = param.grad
+            if param.dim() == 2 and param.shape[0] == k_cov.shape[0] and param.shape[1] == k_cov.shape[1]:
+                update = update + k_cov
+            param.mul_(1.0 - alpha)
+            param.add_(update, alpha=-eta)
 
 
 @dataclass
@@ -192,8 +215,15 @@ class MemorySignals:
 class SelfReferentialTitan(nn.Module):
     """Self-referential module with explicit memories for {k, v, q, eta, alpha, memory}."""
 
-    def __init__(self, features: int, update_hidden: int = 64, query_static: bool = False):
+    def __init__(
+        self,
+        features: int,
+        update_hidden: int | None = None,
+        query_static: bool = True,
+        normalize_qk: bool = True,
+    ):
         super().__init__()
+        update_hidden = update_hidden or features
         self.mk = MemoryMLP(features, hidden_features=update_hidden)
         self.mv = MemoryMLP(features, hidden_features=update_hidden)
         self.mq = MemoryMLP(features, hidden_features=update_hidden)
@@ -201,6 +231,7 @@ class SelfReferentialTitan(nn.Module):
         self.malpha = MemoryMLP(features, hidden_features=update_hidden)
         self.mmemory = MemoryMLP(features, hidden_features=update_hidden)
         self.query_static = query_static
+        self.normalize_qk = normalize_qk
         self.q_proj = Linear(features, features) if query_static else None
         self.scale = nn.Parameter(torch.ones(features))
 
@@ -212,6 +243,9 @@ class SelfReferentialTitan(nn.Module):
         q = self.q_proj(x) if self.q_proj is not None else self.mq(x)
         k = self.mk(x)
         v = self.mv(x)
+        if self.normalize_qk:
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
         eta = F.softplus(self.meta(x))
         alpha = torch.sigmoid(self.malpha(x))
         memory = self.mmemory(q)
@@ -235,19 +269,19 @@ class SelfReferentialTitan(nn.Module):
             v_hat_eta = self.meta(v_hat)
             v_hat_alpha = self.malpha(v_hat)
             if projection_mask[0]:
-                self.mk.dgd_update(signals.k.detach(), v_hat_k.detach(), lr=eta, weight_decay=alpha)
+                self.mk.self_mod_update(signals.k.detach(), v_hat_k.detach(), eta=eta, alpha=alpha)
             if projection_mask[1]:
-                self.mv.dgd_update(signals.k.detach(), v_hat_v.detach(), lr=eta, weight_decay=alpha)
+                self.mv.self_mod_update(signals.k.detach(), v_hat_v.detach(), eta=eta, alpha=alpha)
             if projection_mask[2] and self.q_proj is None:
                 v_hat_q = self.mq(v_hat)
-                self.mq.dgd_update(signals.k.detach(), v_hat_q.detach(), lr=eta, weight_decay=alpha)
+                self.mq.self_mod_update(signals.k.detach(), v_hat_q.detach(), eta=eta, alpha=alpha)
             if projection_mask[3]:
-                self.meta.dgd_update(signals.k.detach(), v_hat_eta.detach(), lr=eta, weight_decay=alpha)
+                self.meta.self_mod_update(signals.k.detach(), v_hat_eta.detach(), eta=eta, alpha=alpha)
             if projection_mask[4]:
-                self.malpha.dgd_update(signals.k.detach(), v_hat_alpha.detach(), lr=eta, weight_decay=alpha)
+                self.malpha.self_mod_update(signals.k.detach(), v_hat_alpha.detach(), eta=eta, alpha=alpha)
         if update_memory:
             v_hat_memory = self.mmemory(v_hat)
-            self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
+            self.mmemory.self_mod_update(signals.k.detach(), v_hat_memory.detach(), eta=eta, alpha=alpha)
             with torch.no_grad():
                 self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
 
@@ -288,13 +322,19 @@ class SelfModifyingStack(nn.Module):
         self,
         features: int,
         depth: int = 2,
-        update_hidden: int = 64,
-        query_static: bool = False,
+        update_hidden: int | None = None,
+        query_static: bool = True,
+        normalize_qk: bool = True,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                SelfReferentialTitan(features, update_hidden=update_hidden, query_static=query_static)
+                SelfReferentialTitan(
+                    features,
+                    update_hidden=update_hidden,
+                    query_static=query_static,
+                    normalize_qk=normalize_qk,
+                )
                 for _ in range(depth)
             ]
         )

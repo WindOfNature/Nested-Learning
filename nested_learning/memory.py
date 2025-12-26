@@ -82,6 +82,22 @@ class MemoryBlock(nn.Module):
     def state(self) -> MemoryState:
         return MemoryState(time=self.state_time, value=self.state_value)
 
+    def load_pretrained_layers(self, layers: Sequence[object]):
+        if len(layers) != len(self.layers):
+            raise ValueError("Pretrained layers count must match CMS block depth")
+        for target, source in zip(self.layers, layers):
+            if isinstance(source, dict):
+                target.weight.data.copy_(source["weight"])
+                if target.bias is not None and "bias" in source and source["bias"] is not None:
+                    target.bias.data.copy_(source["bias"])
+                continue
+            if hasattr(source, "weight"):
+                target.weight.data.copy_(source.weight.data)
+                if target.bias is not None and getattr(source, "bias", None) is not None:
+                    target.bias.data.copy_(source.bias.data)
+                continue
+            raise ValueError("Unsupported pretrained layer type")
+
 
 class ContinuumMemorySystem(nn.Module):
     """Multi-timescale memory system as a chain of memory blocks."""
@@ -124,6 +140,12 @@ class ContinuumMemorySystem(nn.Module):
 
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
+
+    def load_pretrained_blocks(self, blocks: Sequence[Sequence[object]]):
+        if len(blocks) != len(self.blocks):
+            raise ValueError("Pretrained blocks count must match CMS blocks")
+        for block, layers in zip(self.blocks, blocks):
+            block.load_pretrained_layers(layers)
 
 
 class NestedContinuumMemorySystem(nn.Module):
@@ -187,6 +209,13 @@ class NestedContinuumMemorySystem(nn.Module):
             states.extend(sub.states())
         return states
 
+    def load_pretrained_blocks(self, blocks: Sequence[Sequence[object]]):
+        if len(blocks) != len(self.blocks):
+            raise ValueError("Pretrained blocks count must match CMS blocks")
+        for idx, (block, layers) in enumerate(zip(self.blocks, blocks)):
+            block.load_pretrained_layers(layers)
+            self.subsystems[idx].load_pretrained_blocks(blocks[: idx + 1])
+
 
 class SequentialContinuumMemorySystem(nn.Module):
     """Sequential CMS variant with explicit pass-through normalization."""
@@ -230,6 +259,12 @@ class SequentialContinuumMemorySystem(nn.Module):
 
     def states(self) -> List[MemoryState]:
         return [block.state() for block in self.blocks]
+
+    def load_pretrained_blocks(self, blocks: Sequence[Sequence[object]]):
+        if len(blocks) != len(self.blocks):
+            raise ValueError("Pretrained blocks count must match CMS blocks")
+        for block, layers in zip(self.blocks, blocks):
+            block.load_pretrained_layers(layers)
 
 
 class HeadwiseContinuumMemorySystem(nn.Module):
@@ -281,3 +316,7 @@ class HeadwiseContinuumMemorySystem(nn.Module):
         for system in self.systems:
             states.extend(system.states())
         return states
+
+    def load_pretrained_blocks(self, blocks: Sequence[Sequence[object]]):
+        for system in self.systems:
+            system.load_pretrained_blocks(blocks)
