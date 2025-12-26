@@ -277,6 +277,7 @@ class SelfReferentialTitan(nn.Module):
         x_l2 = F.normalize(x_ln, p=2, dim=-1)
         return self.generate_signals(x_l2)
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -327,6 +328,7 @@ class SelfModifyingStack(nn.Module):
             out = layer(out)
         return out
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -370,6 +372,10 @@ class ContextFlowLevel(nn.Module):
         return self.norm(context + self.transform(context))
 
     def update(self, context: torch.Tensor, time: int):
+        if torch.is_grad_enabled() and context.requires_grad:
+            with torch.no_grad():
+                self.state = ContextFlowState(time=time, level=self.state.level, context=context.detach().mean(dim=0, keepdim=True))
+            return
         with torch.enable_grad():
             context_detached = context.detach()
             eta = F.softplus(self.meta(context_detached)).mean().clamp(min=1e-5).item()
@@ -377,8 +383,18 @@ class ContextFlowLevel(nn.Module):
             output = self.forward(context_detached)
             target = context_detached + self.transform(context_detached).detach()
             loss = F.mse_loss(output, target)
-            self.optimizer.zero_grad()
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            grads = torch.autograd.grad(
+                loss,
+                self.parameters(),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for param, grad in zip(self.parameters(), grads):
+                if grad is None:
+                    continue
+                param.grad = grad
             self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
         with torch.no_grad():
             self.state = ContextFlowState(time=time, level=self.state.level, context=output.mean(dim=0, keepdim=True))

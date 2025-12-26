@@ -106,7 +106,7 @@ def train_task(
             # 3. Train with task-weighted replay
             if replay_data is not None:
                 rx, ry, rtask = replay_data
-                logits_current = model.forward(batch_x, time=global_step, task_id=task_id)
+                logits_current = model.forward(batch_x, time=global_step, task_id=task_id, update_memory=False)
                 loss_current = torch.nn.functional.cross_entropy(logits_current, batch_y)
                 loss_replay = 0.0
                 for task_value in torch.unique(rtask):
@@ -124,7 +124,7 @@ def train_task(
                 loss = loss_current + replay_weight * loss_replay
                 combined_x = torch.cat([batch_x, rx], dim=0)
             else:
-                logits_current = model.forward(batch_x, time=global_step, task_id=task_id)
+                logits_current = model.forward(batch_x, time=global_step, task_id=task_id, update_memory=False)
                 loss = torch.nn.functional.cross_entropy(logits_current, batch_y)
                 combined_x = batch_x
 

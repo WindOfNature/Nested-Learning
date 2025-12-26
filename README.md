@@ -67,6 +67,9 @@ model = HOPEModel.from_preset(
     preset="adaptive",
     dataset_size=10_000,
     task_count=4,
+    frequencies=[1, 8, 16, 32, 64],
+    cms_depth=2,
+    cms_memory_chunk_size=16,
     backbone="titans",
 )
 
@@ -101,7 +104,9 @@ logits = model(x, time=0)
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
   --preset adaptive \
-  --max-samples 500
+  --max-samples 500 \
+  --cms-depth 2 \
+  --cms-memory-chunk-size 16
 ```
 
 ### D) CMS multi-level frequencies
@@ -231,9 +236,9 @@ not required for a solid baseline.
 
 If you don’t want to tune hyperparameters, use `preset="adaptive"` with
 `auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, memory
-decay, and (for Titans) CMS frequencies/depth/chunk sizes based on dataset size
-and task count. The other presets keep CMS explicit so you can control it
-directly.
+decay, and (for Titans) **CMS chunk sizes** based on dataset size and task
+count. CMS frequencies/depth/memory chunk size remain explicit so you can
+control the multi-timescale ladder directly.
 
 > Note: Presets default to **no replay**. Replay is only active if you pass
 > non-zero `replay_ratio` and `replay_weight` in your training code.
@@ -242,8 +247,8 @@ directly.
 
 `frequencies` defines the CMS update rates (Eq. 70–71 in the paper). `cms_depth`
 controls the per-level MLP depth inside each memory block. The adaptive preset
-auto-scales CMS **frequencies/depth/chunk sizes** when using the Titans
-backbone, and uses a fixed schedule when using Hope-Attention. You can still
+auto-scales CMS **chunk sizes** for Titans, but keeps `frequencies`, `cms_depth`,
+and `cms_memory_chunk_size` explicit so you can tune the update ladder. You can
 override any of them via `--cms-*` flags or constructor arguments.
 
 `hope_levels` + `lowest_frequency` can still be used as a convenience to generate
@@ -266,10 +271,10 @@ load_optimizer_state(optimizer, "optim_state.pt")
 Example run (as in the paper’s continual-learning style setup):
 
 ```
-Task A accuracy before: 0.740
-Task B accuracy: 0.933
-Task A accuracy after: 0.779
-Forgetting: -0.039
+Task A accuracy before: 1.000
+Task B accuracy: 0.961
+Task A accuracy after: 0.967
+Forgetting: 0.033
 ```
 * Accuracy is shown for the adaptive preset + auto-scale settings using 500 max samples (replay disabled).
 ---

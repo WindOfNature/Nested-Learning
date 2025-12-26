@@ -481,6 +481,8 @@ class HOPEModel(nn.Module):
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
 
+        encoded = encoded.detach()
+
         if self.self_mod is not None:
             self.self_mod.update_chunk(
                 encoded,
@@ -504,6 +506,7 @@ class HOPEModel(nn.Module):
         memory_context, _ = self.cms.forward(normed, time=self.state.time, states=None, update=True)
 
         if self.nested_flow is not None:
+            memory_context = memory_context.detach()
             memory_context = self.nested_flow.forward(memory_context, time=self.state.time, update=True)
 
         task_index = self._select_task(task_id)
