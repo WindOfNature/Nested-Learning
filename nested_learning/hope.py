@@ -31,6 +31,15 @@ class HopeState:
 class HOPEModel(nn.Module):
     @staticmethod
     def preset_config(preset: str) -> dict[str, Any]:
+        if preset == "adaptive":
+            return {
+                "memory_decay": 0.01,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
         if preset == "fast_adapt":
             return {
                 "memory_decay": 0.015,
@@ -159,10 +168,21 @@ class HOPEModel(nn.Module):
         config = cls.preset_config(preset)
         if auto_scale:
             config.update(cls.auto_scale_config(dataset_size, task_count))
-            config.update(cls.auto_scale_cms(dataset_size, task_count, backbone=backbone))
+            if preset == "adaptive":
+                config.update(
+                    cls.auto_scale_cms(
+                        dataset_size,
+                        task_count,
+                        backbone=backbone,
+                        batch_size=overrides.get("batch_size"),
+                    )
+                )
         config.update(overrides)
         config.pop("cms_chunk_size", None)
         config.pop("cms_memory_chunk_size", None)
+        config.pop("batch_size", None)
+        if preset != "adaptive" and "frequencies" not in config and "hope_levels" not in config:
+            raise ValueError("frequencies (or hope_levels) must be provided when using non-adaptive presets")
         return cls(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
