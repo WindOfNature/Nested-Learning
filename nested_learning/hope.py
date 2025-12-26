@@ -123,6 +123,7 @@ class HOPEModel(nn.Module):
         )
         self.decoder = Linear(hidden_dim, output_dim)
         self.norm = LayerNorm(hidden_dim)
+        self.final_norm = LayerNorm(hidden_dim) # Protect decoder from signal explosion
         self.state = HopeState(time=0, memory=None, decoder_memory=None)
 
         self.replay_ratio = replay_ratio
@@ -217,7 +218,8 @@ class HOPEModel(nn.Module):
 
         normed_mem, new_dec_state = self.decoder_mem.update(normed, dec_state, update=update_memory)
 
-        logits = self.decoder(normed_mem)
+        # Apply Final Norm before Linear Decoder
+        logits = self.decoder(self.final_norm(normed_mem))
         if update_memory:
             # We detach states to prevent infinite graph growth across steps,
             # but for BPTT within a window we might want to keep it?

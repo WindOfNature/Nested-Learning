@@ -49,18 +49,23 @@ class MemoryBlock(nn.Module):
         self.step_counter = 0
 
     def forward(self, x: torch.Tensor, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Pre-Norm Stability: Normalize input for processing
+        x_ln = self.norm(x)
+        # L2 Norm for Attention-like stability (prevent signal explosion in gates)
+        x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
         # Memory content generation (MLP)
-        # Apply normalization to input, but remove from output to allow magnitude growth
-        mem = self.norm(x)
+        # Use x_l2 for stability
+        mem = x_l2
         for layer in self.layers:
             mem = F.relu(layer(mem))
         # No output normalization
 
-        # Meta-learning signals
-        eta = torch.sigmoid(self.meta(x)) * 0.1
-        alpha = torch.sigmoid(self.malpha(x))
+        # Meta-learning signals using stabilized input
+        eta = torch.sigmoid(self.meta(x_l2)) * 0.1
+        alpha = torch.sigmoid(self.malpha(x_l2))
 
-        # Gated residual update
+        # Gated residual update on ORIGINAL x
         out = x + eta * mem
 
         # Continuum state update (BPTT friendly)
@@ -90,8 +95,11 @@ class MemoryBlock(nn.Module):
             # Local loss should only update the Memory Content weights (layers).
 
             x_det = x.detach()
-            # Recompute mem with detached input
-            mem_local = self.norm(x_det)
+            # Recompute mem with detached input using same normalization
+            x_ln = self.norm(x_det)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+            mem_local = x_l2
             for layer in self.layers:
                 mem_local = F.relu(layer(mem_local))
             # No output norm
@@ -132,13 +140,21 @@ class MemoryBlock(nn.Module):
             # Recompute memory content with updated weights to allow gradient flow
             # The weights have changed, so we must re-run the forward pass for 'mem'
             # to attach it to the graph correctly for downstream tasks.
-            mem_new = self.norm(x)
+            # Note: We must re-compute normalization on x (attached)
+            x_ln = self.norm(x)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+            # Recompute eta using new norm (since norm was updated)
+            eta_new = torch.sigmoid(self.meta(x_l2)) * 0.1
+
+            mem_new = x_l2
             for layer in self.layers:
                 mem_new = F.relu(layer(mem_new))
             # No output norm
 
             # Use new memory content
             mem = mem_new
+            eta_tensor = eta_new
 
         # Update replay buffer (detached)
         if self.replay_ratio > 0.0:

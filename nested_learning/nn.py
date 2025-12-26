@@ -210,6 +210,7 @@ class SelfReferentialTitan(nn.Module):
 
     def __init__(self, features: int, update_hidden: int = 64, query_static: bool = False):
         super().__init__()
+        self.norm = LayerNorm(features)
         self.mk = MemoryMLP(features, hidden_features=update_hidden)
         self.mv = MemoryMLP(features, hidden_features=update_hidden)
         self.mq = MemoryMLP(features, hidden_features=update_hidden)
@@ -221,10 +222,15 @@ class SelfReferentialTitan(nn.Module):
         self.scale = nn.Parameter(torch.ones(features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        signals = self.generate_signals(x)
+        # Pre-Norm + L2 Stability
+        x_ln = self.norm(x)
+        x_l2 = F.normalize(x_ln, p=2, dim=-1)
+
+        signals = self.generate_signals(x_l2)
         return x + signals.eta * signals.memory
 
     def generate_signals(self, x: torch.Tensor) -> MemorySignals:
+        # x is assumed normalized
         q = self.q_proj(x) if self.q_proj is not None else self.mq(x)
         k = self.mk(x)
         v = self.mv(x)
@@ -267,7 +273,9 @@ class SelfReferentialTitan(nn.Module):
 
     def _compute_signals(self, x: torch.Tensor) -> MemorySignals:
         x_detached = x.detach()
-        return self.generate_signals(x_detached)
+        x_ln = self.norm(x_detached)
+        x_l2 = F.normalize(x_ln, p=2, dim=-1)
+        return self.generate_signals(x_l2)
 
     def update_chunk(
         self,
