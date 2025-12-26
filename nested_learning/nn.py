@@ -15,7 +15,7 @@ from .torch_optim import DGD
 
 
 class Linear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, use_kernels: bool = True):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, use_kernels: bool = False):
         super().__init__()
         scale = (2.0 / in_features) ** 0.5
         weight = torch.randn(in_features, out_features) * scale
@@ -26,6 +26,13 @@ class Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 1:
             x = x.unsqueeze(0)
+
+        if self.training or not self.use_kernels:
+            out = x @ self.weight
+            if self.bias is not None:
+                out = out + self.bias
+            return out
+
         if self.use_kernels and not torch.is_grad_enabled():
             if x.is_cuda and gpu_kernels.available().available:
                 out = gpu_kernels.matmul(x, self.weight)
@@ -41,7 +48,7 @@ class Linear(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, features: int, eps: float = 1e-5, use_kernels: bool = True):
+    def __init__(self, features: int, eps: float = 1e-5, use_kernels: bool = False):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(features))
         self.beta = nn.Parameter(torch.zeros(features))
@@ -49,6 +56,11 @@ class LayerNorm(nn.Module):
         self.use_kernels = use_kernels
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training or not self.use_kernels:
+             mean = x.mean(dim=-1, keepdim=True)
+             var = x.var(dim=-1, keepdim=True, unbiased=False)
+             return (x - mean) / torch.sqrt(var + self.eps) * self.gamma + self.beta
+
         if self.use_kernels and not torch.is_grad_enabled():
             if x.is_cuda and gpu_kernels.available().available:
                 return gpu_kernels.layernorm(x, self.gamma, self.beta, self.eps)
@@ -77,6 +89,10 @@ class MemoryMLP(nn.Module):
         hidden = hidden_features or features * 2
         self.fc1 = Linear(features, hidden)
         self.fc2 = Linear(hidden, features)
+        # Initialize last layer to zero for identity behavior at start
+        nn.init.zeros_(self.fc2.weight)
+        if self.fc2.bias is not None:
+            nn.init.zeros_(self.fc2.bias)
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -206,13 +222,13 @@ class SelfReferentialTitan(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         signals = self.generate_signals(x)
-        return x + signals.memory
+        return x + signals.eta * signals.memory
 
     def generate_signals(self, x: torch.Tensor) -> MemorySignals:
         q = self.q_proj(x) if self.q_proj is not None else self.mq(x)
         k = self.mk(x)
         v = self.mv(x)
-        eta = F.softplus(self.meta(x))
+        eta = torch.sigmoid(self.meta(x)) * 0.1
         alpha = torch.sigmoid(self.malpha(x))
         memory = self.mmemory(q)
         return MemorySignals(k=k, v=v, q=q, eta=eta, alpha=alpha, memory=memory)
@@ -248,8 +264,6 @@ class SelfReferentialTitan(nn.Module):
         if update_memory:
             v_hat_memory = self.mmemory(v_hat)
             self.mmemory.dgd_update(signals.k.detach(), v_hat_memory.detach(), lr=eta, weight_decay=alpha)
-            with torch.no_grad():
-                self.mmemory.fc2.weight.add_(self.scale * signals.memory.mean(dim=0))
 
     def _compute_signals(self, x: torch.Tensor) -> MemorySignals:
         x_detached = x.detach()
@@ -302,7 +316,7 @@ class SelfModifyingStack(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x
         for layer in self.layers:
-            out = F.relu(layer(out))
+            out = layer(out)
         return out
 
     def update_chunk(
