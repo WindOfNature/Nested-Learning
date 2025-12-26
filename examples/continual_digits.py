@@ -49,16 +49,14 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
             args.task_b_epochs = max(args.epochs, 10)
 
     if args.preset == "adaptive":
+        if args.cms_frequencies is None:
+            args.cms_frequencies = [1, 8, 16, 32, 64]
         cms_config = HOPEModel.auto_scale_cms(
             dataset_size,
             task_count,
             backbone=args.backbone,
             batch_size=args.batch_size,
         )
-        if args.cms_frequencies is None:
-            args.cms_frequencies = cms_config.get("frequencies", args.cms_frequencies)
-        if args.cms_depth is None:
-            args.cms_depth = cms_config.get("cms_depth", args.cms_depth)
         if args.cms_chunk_size is None:
             args.cms_chunk_size = cms_config.get("cms_chunk_size", args.cms_chunk_size)
         if args.cms_memory_chunk_size is None:
@@ -257,8 +255,10 @@ def main():
 
     args = apply_presets(args, dataset_size=total_train, task_count=2)
 
-    if args.cms_frequencies is None or args.cms_depth is None or args.cms_chunk_size is None or args.cms_memory_chunk_size is None:
-        raise ValueError("CMS hyperparameters are required unless using preset='adaptive'")
+    if args.cms_frequencies is None or args.cms_depth is None or args.cms_memory_chunk_size is None:
+        raise ValueError("CMS frequencies, depth, and memory chunk size are required")
+    if args.cms_chunk_size is None and not (args.preset == "adaptive" and args.auto_scale):
+        raise ValueError("CMS chunk size is required unless using preset='adaptive' with auto-scale")
 
     if args.preset != "custom":
         model = HOPEModel.from_preset(

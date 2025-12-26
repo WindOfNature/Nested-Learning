@@ -95,8 +95,6 @@ class HOPEModel(nn.Module):
 
         if backbone == "attention":
             return {
-                "frequencies": [1, 8, 16],
-                "cms_depth": 2,
                 "cms_chunk_size": 8,
                 "cms_memory_chunk_size": 16,
             }
@@ -117,32 +115,11 @@ class HOPEModel(nn.Module):
             slowest_target = max(slowest_target, 2048)
         slowest_chunk = min(8192, snap_pow2(slowest_target, minimum=128))
 
-        base_frequencies = [1, 16, 32, 64]
-        frequencies = base_frequencies + [slowest_chunk]
-        frequencies = sorted(set(frequencies))
-        while len(frequencies) < 5:
-            candidate = frequencies[-1] * 2
-            if candidate > slowest_chunk:
-                candidate = slowest_chunk
-            if candidate == frequencies[-1]:
-                break
-            frequencies.append(candidate)
-        if len(frequencies) > 5:
-            frequencies = frequencies[:4] + [frequencies[-1]]
-
-        cms_depth = 2
-        if task_count >= 2 or dataset_size >= 512:
-            cms_depth = 3
-        if dataset_size >= 20000 or task_count >= 4:
-            cms_depth = 4
-
         chunk_base = max(4, min(16, slowest_chunk // 16))
         cms_chunk_size = max(4, min(32, chunk_base))
         cms_memory_chunk_size = max(cms_chunk_size, min(64, cms_chunk_size * 2))
 
         return {
-            "frequencies": frequencies,
-            "cms_depth": cms_depth,
             "cms_chunk_size": cms_chunk_size,
             "cms_memory_chunk_size": cms_memory_chunk_size,
         }
@@ -600,11 +577,6 @@ class HOPEModel(nn.Module):
             backbone=self.backbone,
             batch_size=batch_size,
         )
-        frequencies = config.get("frequencies")
-        if frequencies:
-            for block, freq in zip(self._iter_cms_blocks(), frequencies):
-                block.frequency = freq
-            self._last_frequencies = list(frequencies)
         self.cms_chunk_size = config.get("cms_chunk_size", self.cms_chunk_size)
         self.cms_memory_chunk_size = config.get("cms_memory_chunk_size", self.cms_memory_chunk_size)
         self._cms_autoscale_cooldown = max(1, cooldown_steps)
