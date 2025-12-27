@@ -44,7 +44,7 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
         if args.replay_ratio > 0.0:
             args.replay_ratio = auto_config.get("replay_ratio", args.replay_ratio)
         args.memory_decay = auto_config.get("memory_decay", args.memory_decay)
-        if args.replay_weight > 0.0:
+        if args.replay_ratio > 0.0:
             args.replay_weight = min(0.3, 0.05 + 0.02 * task_count)
         if args.task_b_epochs is None:
             args.task_b_epochs = max(args.epochs, 10)
