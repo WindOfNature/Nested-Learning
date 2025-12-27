@@ -121,31 +121,15 @@ def train_task(
             # 3. Train with task-weighted replay
             if replay_data is not None:
                 rx, ry, rtask = replay_data
-                replay_features, _, _ = model.forward_features(
-                    rx,
+                combined_x = torch.cat([batch_x, rx], dim=0)
+                combined_features, new_cms_states, _ = model.forward_features(
+                    combined_x,
                     time=global_step,
                     update_memory=False,
                     state=running_state,
                 )
-                loss_replay = 0.0
-                replay_dec_state = None
-                for task_value in torch.unique(rtask):
-                    mask = rtask == task_value
-                    if not mask.any():
-                        continue
-                    logits_replay, replay_dec_state, _ = model.forward_decoder(
-                        replay_features[mask],
-                        task_id=int(task_value.item()),
-                        update_memory=False,
-                        state=running_state,
-                    )
-                    loss_replay = loss_replay + torch.nn.functional.cross_entropy(logits_replay, ry[mask])
-                current_features, new_cms_states, _ = model.forward_features(
-                    batch_x,
-                    time=global_step,
-                    update_memory=False,
-                    state=running_state,
-                )
+                current_features = combined_features[: batch_x.size(0)]
+                replay_features = combined_features[batch_x.size(0) :]
                 logits_current, new_dec_state, _ = model.forward_decoder(
                     current_features,
                     task_id=task_id,
@@ -153,6 +137,18 @@ def train_task(
                     state=running_state,
                 )
                 loss_current = torch.nn.functional.cross_entropy(logits_current, batch_y)
+                loss_replay = 0.0
+                for task_value in torch.unique(rtask):
+                    mask = rtask == task_value
+                    if not mask.any():
+                        continue
+                    logits_replay, _, _ = model.forward_decoder(
+                        replay_features[mask],
+                        task_id=int(task_value.item()),
+                        update_memory=False,
+                        state=running_state,
+                    )
+                    loss_replay = loss_replay + torch.nn.functional.cross_entropy(logits_replay, ry[mask])
                 loss = loss_current + replay_weight * loss_replay
             else:
                 current_features, new_cms_states, _ = model.forward_features(
@@ -188,21 +184,21 @@ def train_task(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if model.backbone == "titans":
-                with torch.no_grad():
-                    current_features, _, _ = model.forward_features(
+            with torch.no_grad():
+                if replay_data is not None:
+                    model.forward_features(
+                        combined_x,
+                        time=global_step,
+                        update_memory=True,
+                        state=running_state,
+                    )
+                else:
+                    model.forward_features(
                         batch_x,
                         time=global_step,
                         update_memory=True,
                         state=running_state,
                     )
-                    model.forward_decoder(
-                        current_features,
-                        task_id=task_id,
-                        update_memory=True,
-                        state=running_state,
-                    )
-
 
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
