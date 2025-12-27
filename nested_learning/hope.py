@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, List
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,12 +29,155 @@ class HopeState:
 
 
 class HOPEModel(nn.Module):
+    @staticmethod
+    def preset_config(preset: str) -> dict[str, Any]:
+        if preset == "adaptive":
+            return {
+                "memory_decay": 0.05,
+                "replay_ratio": 0.1,
+                "replay_steps": 1,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        if preset == "fast_adapt":
+            return {
+                "memory_decay": 0.015,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
+                "self_mod_depth": 4,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        if preset == "high_retention":
+            return {
+                "memory_decay": 0.01,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        if preset == "balanced":
+            return {
+                "memory_decay": 0.01,
+                "replay_ratio": 0.0,
+                "replay_steps": 0,
+                "self_mod_depth": 3,
+                "nested_depth": 2,
+                "nested_hidden": 128,
+            }
+        raise ValueError(f"Unknown preset: {preset}")
+
+    @staticmethod
+    def auto_scale_config(dataset_size: int | None, task_count: int | None) -> dict[str, Any]:
+        if not dataset_size or not task_count:
+            return {}
+        replay_buffer = int(min(20000, max(512, dataset_size * task_count)))
+        replay_ratio = min(0.65, 0.2 + 0.1 * task_count)
+        memory_decay = min(0.05, 0.005 + 0.003 * math.log2(task_count + 1))
+        return {
+            "replay_buffer": replay_buffer,
+            "replay_ratio": replay_ratio,
+            "memory_decay": memory_decay,
+        }
+
+    @staticmethod
+    def auto_scale_cms(
+        dataset_size: int | None,
+        task_count: int | None,
+        *,
+        backbone: str = "titans",
+        batch_size: int | None = None,
+    ) -> dict[str, Any]:
+        if not dataset_size or not task_count:
+            return {}
+
+        min_chunk_size = 64
+        if batch_size:
+            min_chunk_size = max(min_chunk_size, batch_size)
+        if backbone == "attention":
+            return {
+                "cms_chunk_size": min_chunk_size,
+                "cms_memory_chunk_size": max(min_chunk_size, min_chunk_size * 2),
+            }
+
+        steps_per_task = max(1, math.ceil(dataset_size / task_count))
+        if batch_size:
+            steps_per_task = max(1, math.ceil(steps_per_task / batch_size))
+
+        def snap_pow2(value: float, minimum: int = 1) -> int:
+            return max(minimum, int(2 ** round(math.log2(max(value, 1)))))
+
+        scale = 2 + task_count
+        base_min = 128
+        slowest_target = max(base_min, int(round(steps_per_task * scale)))
+        if dataset_size >= 10000 or task_count >= 4:
+            slowest_target = max(slowest_target, 512)
+        if dataset_size >= 50000 or task_count >= 8:
+            slowest_target = max(slowest_target, 2048)
+        slowest_chunk = min(8192, snap_pow2(slowest_target, minimum=128))
+
+        chunk_base = max(min_chunk_size, min(64, slowest_chunk // 16))
+        cms_chunk_size = max(min_chunk_size, min(64, chunk_base))
+        cms_memory_chunk_size = max(cms_chunk_size, min(64, cms_chunk_size * 2))
+
+        return {
+            "cms_chunk_size": cms_chunk_size,
+            "cms_memory_chunk_size": cms_memory_chunk_size,
+        }
+
+    @classmethod
+    def from_preset(
+        cls,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        *,
+        preset: str = "balanced",
+        dataset_size: int | None = None,
+        task_count: int | None = None,
+        auto_scale: bool = True,
+        **overrides: Any,
+    ) -> "HOPEModel":
+        backbone = overrides.get("backbone", "titans")
+        config = cls.preset_config(preset)
+        if auto_scale:
+            config.update(cls.auto_scale_config(dataset_size, task_count))
+            if preset == "adaptive":
+                config.update(
+                    cls.auto_scale_cms(
+                        dataset_size,
+                        task_count,
+                        backbone=backbone,
+                        batch_size=overrides.get("batch_size"),
+                    )
+                )
+        config.update(overrides)
+        cms_chunk_size = config.pop("cms_chunk_size", None)
+        cms_memory_chunk_size = config.pop("cms_memory_chunk_size", None)
+        config.pop("batch_size", None)
+        if preset != "adaptive" and "frequencies" not in config and "hope_levels" not in config:
+            raise ValueError("frequencies (or hope_levels) must be provided when using non-adaptive presets")
+        model = cls(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            task_count=task_count,
+            **config,
+        )
+        model.cms_chunk_size = cms_chunk_size
+        model.cms_memory_chunk_size = cms_memory_chunk_size
+        return model
+
     def __init__(
         self,
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
+        task_count: int | None = None,
         frequencies: List[int] | None = None,
+        cms_depth: int = 2,
         cms_variant: str = "nested",
         self_mod_depth: int = 2,
         heads: int = 4,
@@ -52,15 +196,17 @@ class HOPEModel(nn.Module):
         conv_kernel: int = 3,
         use_pre_norm: bool = True,
         use_post_norm: bool = True,
+        use_kernels: bool = True,
     ):
         super().__init__()
         if frequencies is None:
             if hope_levels is None:
-                raise ValueError("frequencies or hope_levels must be provided")
-            frequencies = [lowest_frequency * (2**idx) for idx in range(hope_levels)]
-        self.encoder = Linear(input_dim, hidden_dim)
-        self.pre_norm = LayerNorm(hidden_dim) if use_pre_norm else None
-        self.post_norm = LayerNorm(hidden_dim) if use_post_norm else None
+                frequencies = [1, 8, 16]
+            else:
+                frequencies = [lowest_frequency * (2**idx) for idx in range(hope_levels)]
+        self.encoder = Linear(input_dim, hidden_dim, use_kernels=use_kernels)
+        self.pre_norm = LayerNorm(hidden_dim, use_kernels=use_kernels) if use_pre_norm else None
+        self.post_norm = LayerNorm(hidden_dim, use_kernels=use_kernels) if use_post_norm else None
         self.use_conv = use_conv
         self.conv = (
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=conv_kernel, padding=conv_kernel // 2)
@@ -71,6 +217,7 @@ class HOPEModel(nn.Module):
             self.cms = NestedContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -80,6 +227,7 @@ class HOPEModel(nn.Module):
             self.cms = SequentialContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -90,6 +238,7 @@ class HOPEModel(nn.Module):
                 hidden_dim,
                 frequencies=frequencies,
                 heads=heads,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
@@ -99,61 +248,190 @@ class HOPEModel(nn.Module):
             self.cms = ContinuumMemorySystem(
                 hidden_dim,
                 frequencies=frequencies,
+                depth=cms_depth,
                 decay=memory_decay,
                 replay_ratio=replay_ratio,
                 replay_steps=replay_steps,
                 replay_buffer=replay_buffer,
             )
-        self.nested_flow = NestedContextFlow(hidden_dim, depth=nested_depth, hidden=nested_hidden) if nested_depth else None
+        self.nested_flow = (
+            NestedContextFlow(hidden_dim, depth=nested_depth, hidden=nested_hidden, use_kernels=use_kernels)
+            if nested_depth
+            else None
+        )
         self.backbone = backbone
         self.self_mod_projection_mask = self_mod_projection_mask
         self.self_mod = (
-            SelfModifyingStack(hidden_dim, depth=self_mod_depth, query_static=self_mod_query_static)
+            SelfModifyingStack(
+                hidden_dim,
+                depth=self_mod_depth,
+                query_static=self_mod_query_static,
+                use_kernels=use_kernels,
+            )
             if backbone == "titans"
             else None
         )
-        self.attention = AttentionBlock(hidden_dim, heads=heads) if backbone == "attention" else None
-        # Memory-Augmented Decoder to protect mapping
-        self.decoder_mem = MemoryBlock(
-            hidden_dim,
-            frequency=1,
-            depth=1,
-            replay_ratio=replay_ratio,
-            replay_buffer=replay_buffer
+        self.cms_chunk_size: int | None = None
+        self.cms_memory_chunk_size: int | None = None
+        self._ema_loss: float | None = None
+        self._ema_acc: float | None = None
+        self._best_acc: float | None = None
+        self._cms_autoscale_cooldown = 0
+        self._last_frequencies: list[int] | None = None
+        self.attention = (
+            AttentionBlock(hidden_dim, heads=heads, use_kernels=use_kernels) if backbone == "attention" else None
         )
-        self.decoder = Linear(hidden_dim, output_dim)
-        self.norm = LayerNorm(hidden_dim)
-        self.final_norm = LayerNorm(hidden_dim) # Protect decoder from signal explosion
+        # Memory-Augmented Decoder to protect mapping
+        self.task_count = task_count
+        if task_count:
+            self.decoder_memories = nn.ModuleList(
+                [
+                    MemoryBlock(
+                        hidden_dim,
+                        frequency=1,
+                        depth=1,
+                        replay_ratio=replay_ratio,
+                        replay_buffer=replay_buffer,
+                    )
+                    for _ in range(task_count)
+                ]
+            )
+            self.decoder_heads = nn.ModuleList([Linear(hidden_dim, output_dim) for _ in range(task_count)])
+            self.decoder_mem = None
+            self.decoder = None
+        else:
+            self.decoder_mem = MemoryBlock(
+                hidden_dim,
+                frequency=1,
+                depth=1,
+                replay_ratio=replay_ratio,
+                replay_buffer=replay_buffer,
+            )
+            self.decoder = Linear(hidden_dim, output_dim)
+            self.decoder_memories = None
+            self.decoder_heads = None
+        self.norm = LayerNorm(hidden_dim, use_kernels=use_kernels)
+        self.final_norm = LayerNorm(hidden_dim, use_kernels=use_kernels) # Protect decoder from signal explosion
         self.state = HopeState(time=0, memory=None, decoder_memory=None)
 
         self.replay_ratio = replay_ratio
         self.replay_steps = replay_steps
-        self.raw_replay_buffer = deque(maxlen=replay_buffer)
+        self.replay_buffer_limit = replay_buffer
+        self.raw_replay_buffer: dict[int, deque[tuple[torch.Tensor, torch.Tensor]]] = {}
 
         self._last_context: torch.Tensor | None = None
         self._last_logits: torch.Tensor | None = None
+        self._last_task_id: int | None = None
 
-    def remember(self, x: torch.Tensor, y: torch.Tensor):
-        # Store raw experience as tuples (x, y)
+    def _select_task(self, task_id: int | None) -> int:
+        if self.task_count is None:
+            if task_id is not None:
+                raise ValueError("task_id provided but task_count is not set")
+            return 0
+        return task_id or 0
+
+    def _chunked_linear(self, x: torch.Tensor, linear: Linear, chunk_size: int | None) -> torch.Tensor:
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        chunk_size = chunk_size or x.size(0)
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        original = x.size(0)
+        chunks = (original + chunk_size - 1) // chunk_size
+        pad = chunks * chunk_size - original
+        if pad:
+            x = torch.cat([x, x.new_zeros(pad, x.size(1))], dim=0)
+        x_chunks = x.view(chunks, chunk_size, x.size(1))
+        weight = linear.weight
+        weight_chunks = weight.unsqueeze(0).expand(chunks, -1, -1)
+        out_chunks = torch.bmm(x_chunks, weight_chunks)
+        if linear.bias is not None:
+            out_chunks = out_chunks + linear.bias
+        out = out_chunks.reshape(-1, out_chunks.size(-1))
+        return out[:original]
+
+    def remember(self, x: torch.Tensor, y: torch.Tensor, task_id: int | None = None):
+        # Store raw experience as tuples (x, y) per task
+        buffer_key = task_id if task_id is not None else -1
+        if buffer_key not in self.raw_replay_buffer:
+            self.raw_replay_buffer[buffer_key] = deque(maxlen=self.replay_buffer_limit)
         x_detached = x.detach().cpu()
         y_detached = y.detach().cpu()
         for i in range(x.size(0)):
-            self.raw_replay_buffer.append((x_detached[i], y_detached[i]))
+            self.raw_replay_buffer[buffer_key].append((x_detached[i], y_detached[i]))
 
-    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor] | None:
-        if len(self.raw_replay_buffer) < batch_size:
+    def sample_replay(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not self.raw_replay_buffer:
+            return None
+        total_samples = sum(len(buf) for buf in self.raw_replay_buffer.values())
+        if total_samples < batch_size:
             return None
         import random
-        samples = random.sample(self.raw_replay_buffer, batch_size)
-        x_list, y_list = zip(*samples)
+        buffers = list(self.raw_replay_buffer.items())
+        per_task = max(1, batch_size // len(buffers))
+        samples: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+        for task_key, buf in buffers:
+            if not buf:
+                continue
+            take = min(per_task, len(buf))
+            samples.extend((task_key, x, y) for x, y in random.sample(buf, take))
+        remaining = batch_size - len(samples)
+        if remaining > 0:
+            flat_buffer = [(task_key, x, y) for task_key, buf in buffers for x, y in buf]
+            samples.extend(random.sample(flat_buffer, remaining))
+        task_ids, x_list, y_list = zip(*samples)
         # Move to device of current parameters
-        device = self.decoder.weight.device
+        device = next(self.parameters()).device
         x_batch = torch.stack(x_list).to(device)
         y_batch = torch.stack(y_list).to(device)
-        return x_batch, y_batch
+        task_batch = torch.tensor(task_ids, device=device, dtype=torch.long)
+        return x_batch, y_batch, task_batch
 
-    def forward(self, x: torch.Tensor, time: int, update_memory: bool = True) -> torch.Tensor:
-        encoded = F.relu(self.encoder(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        time: int,
+        update_memory: bool = True,
+        task_id: int | None = None,
+        detach_encoder: bool = False,
+    ) -> torch.Tensor:
+        memory_context, new_cms_states, encoded = self.forward_features(
+            x,
+            time=time,
+            update_memory=update_memory,
+            detach_encoder=detach_encoder,
+        )
+        logits, new_dec_state, task_index = self.forward_decoder(
+            memory_context,
+            task_id=task_id,
+            update_memory=update_memory,
+        )
+        if update_memory:
+            if encoded.requires_grad:
+                encoded.retain_grad()
+            self.state = HopeState(
+                time=time,
+                memory=[s.detach() if isinstance(s, torch.Tensor) else s for s in new_cms_states],
+                decoder_memory=new_dec_state.detach(),
+            )
+            self._last_context = encoded
+            logits.retain_grad()
+            self._last_logits = logits
+            self._last_task_id = task_index
+        return logits
+
+    def forward_features(
+        self,
+        x: torch.Tensor,
+        time: int,
+        update_memory: bool = True,
+        detach_encoder: bool = False,
+        state: HopeState | None = None,
+    ) -> tuple[torch.Tensor, List[Any], torch.Tensor]:
+        chunk_size = self.cms_chunk_size or x.size(0)
+        encoded = F.relu(self._chunked_linear(x, self.encoder, chunk_size))
+        if detach_encoder:
+            encoded = encoded.detach()
         if self.pre_norm is not None:
             encoded = self.pre_norm(encoded)
         if self.conv is not None:
@@ -162,94 +440,135 @@ class HOPEModel(nn.Module):
             else:
                 encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
 
-        # CMS update with state passing
-        current_states = self.state.memory
-        # If batch size changed (e.g. last batch), reset states to avoid mismatch
-        if current_states is not None:
-             # Check first state tensor if available
-             # current_states is a list. It might contain Tensors or lists (nested).
-             # We need to find a tensor to check dimension.
-             # Simply: if we catch an error, or check proactively.
-             # Proactive check:
-             # Flatten structure to find first tensor?
-             # Or just try/except? No.
-             # Let's assume flat list for simple CMS, nested for others.
-             # We'll just reset if x.size(0) doesn't match expected.
-             # BUT we don't know expected easily without inspecting current_states.
-             # Let's just catch size mismatch by checking the first block state if possible.
-             # Or safer: if current_states matches x size.
-             pass
-             # Easier: Just pass current_states. If None, CMS inits.
-             # If dimensions mismatch, CMS will crash.
-             # So we must check.
-
-        # Helper to check batch dimension match
-        def check_batch_dim(states, batch_size):
-            if states is None: return False
-            if isinstance(states, (list, tuple)):
-                if not states: return True
-                return check_batch_dim(states[0], batch_size)
-            if isinstance(states, torch.Tensor):
-                return states.size(0) == batch_size
-            return True # Unknown type
-
-        if not check_batch_dim(current_states, encoded.size(0)):
-             current_states = None
-
-        memory_context, new_cms_states = self.cms.forward(encoded, time, states=current_states, update=update_memory)
-
-        if self.nested_flow is not None:
-            memory_context = self.nested_flow.forward(memory_context, time, update=update_memory)
         if self.backbone == "attention":
-            modulated = self.attention(memory_context)
+            modulated = self.attention(encoded)
         else:
-            modulated = self.self_mod(memory_context)
+            if update_memory and torch.is_grad_enabled():
+                chunk_size = self.cms_chunk_size or encoded.size(0)
+                memory_chunk = self.cms_memory_chunk_size or chunk_size
+                with torch.no_grad():
+                    self.self_mod.update_chunk_and_forward(
+                        encoded.detach(),
+                        chunk_size=chunk_size,
+                        memory_chunk_size=memory_chunk,
+                        projection_mask=self.self_mod_projection_mask,
+                    )
+            elif update_memory:
+                chunk_size = self.cms_chunk_size or encoded.size(0)
+                memory_chunk = self.cms_memory_chunk_size or chunk_size
+                modulated = self.self_mod.update_chunk_and_forward(
+                    encoded,
+                    chunk_size=chunk_size,
+                    memory_chunk_size=memory_chunk,
+                    projection_mask=self.self_mod_projection_mask,
+                )
+            modulated = self.self_mod(encoded)
         normed = self.norm(modulated)
         if self.post_norm is not None:
             normed = self.post_norm(normed)
 
-        # Update Decoder Memory
-        dec_state = self.state.decoder_memory
-        # Check dim
-        if dec_state is not None and dec_state.size(0) != normed.size(0):
+        def check_batch_dim(states, batch_size):
+            if states is None:
+                return False
+            if isinstance(states, (list, tuple)):
+                if not states:
+                    return True
+                return check_batch_dim(states[0], batch_size)
+            if isinstance(states, torch.Tensor):
+                return states.size(0) == batch_size
+            return True
+
+        current_states = self.state.memory if state is None else state.memory
+
+        if update_memory:
+            if not check_batch_dim(current_states, normed.size(0)):
+                current_states = None
+            if torch.is_grad_enabled():
+                with torch.no_grad():
+                    mem_ctx, new_cms_states = self.cms.forward(
+                        normed.detach(),
+                        time,
+                        states=current_states,
+                        update=True,
+                    )
+                    if self.nested_flow is not None:
+                        mem_ctx = self.nested_flow.forward(mem_ctx, time, update=True)
+                memory_context, _ = self.cms.forward(normed, time, states=current_states, update=False)
+                if self.nested_flow is not None:
+                    memory_context = self.nested_flow.forward(memory_context, time, update=False)
+            else:
+                memory_context, new_cms_states = self.cms.forward(normed, time, states=current_states, update=True)
+                if self.nested_flow is not None:
+                    memory_context = self.nested_flow.forward(memory_context, time, update=True)
+        else:
+            if not check_batch_dim(current_states, normed.size(0)):
+                current_states = None
+            memory_context, new_cms_states = self.cms.forward(normed, time, states=current_states, update=False)
+            if self.nested_flow is not None:
+                memory_context = self.nested_flow.forward(memory_context, time, update=False)
+
+        return memory_context, new_cms_states, encoded
+
+    def forward_decoder(
+        self,
+        memory_context: torch.Tensor,
+        task_id: int | None = None,
+        update_memory: bool = True,
+        state: HopeState | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        task_index = self._select_task(task_id)
+
+        if self.task_count:
+            decoder_mem = self.decoder_memories[task_index]
+            decoder = self.decoder_heads[task_index]
+        else:
+            decoder_mem = self.decoder_mem
+            decoder = self.decoder
+
+        dec_state = self.state.decoder_memory if state is None else state.decoder_memory
+        if dec_state is not None and dec_state.size(0) != memory_context.size(0):
             dec_state = None
         if dec_state is None:
-            dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
-
-        normed_mem, new_dec_state = self.decoder_mem.update(normed, dec_state, update=update_memory)
-
-        # Apply Final Norm before Linear Decoder
-        logits = self.decoder(self.final_norm(normed_mem))
-        if update_memory:
-            # We detach states to prevent infinite graph growth across steps,
-            # but for BPTT within a window we might want to keep it?
-            # Standard RNN practice is detach between batches.
-            # Here we assume user handles truncation or we detach.
-            # But wait, "Fix BPTT Break" suggests we want gradients.
-            # If we detach here, we break BPTT across calls to forward.
-            # Assuming typical usage (like in examples), forward is called per batch.
-            # States should probably be detached unless doing TBPTT.
-            # The prompt says "Fix BPTT Break: Updating state_value inside no_grad breaks... Pass hidden_state explicitly".
-            # This allows gradients to flow IF the user wants them (e.g. sequence training).
-            # But we store it in self.state.
-            # I will detach here to be safe for infinite loops, but return/keep graph if needed?
-            # self.state is used for next step.
-            self.state = HopeState(
-                time=time,
-                memory=[s.detach() if isinstance(s, torch.Tensor) else s for s in new_cms_states],
-                decoder_memory=new_dec_state.detach()
+            dec_state = torch.zeros(
+                memory_context.size(0),
+                memory_context.size(1),
+                device=memory_context.device,
+                dtype=memory_context.dtype,
             )
-            self._last_context = memory_context
-            logits.retain_grad()
-            self._last_logits = logits
-        return logits
+
+        if update_memory and torch.is_grad_enabled():
+            with torch.no_grad():
+                _, new_dec_state = decoder_mem.update(
+                    memory_context.detach(),
+                    dec_state.detach() if isinstance(dec_state, torch.Tensor) else dec_state,
+                    update=True,
+                )
+            normed_mem, _ = decoder_mem.update(memory_context, dec_state, update=False)
+        else:
+            normed_mem, new_dec_state = decoder_mem.update(memory_context, dec_state, update=update_memory)
+        logits = decoder(self.final_norm(normed_mem))
+        return logits, new_dec_state, task_index
 
     def update_chunk(
         self,
         x: torch.Tensor,
         chunk_size: int | None = None,
         memory_chunk_size: int | None = None,
+        task_id: int | None = None,
     ):
+        def expand_state(state, batch_size: int):
+            if state is None:
+                return None
+            if isinstance(state, torch.Tensor):
+                if state.size(0) == batch_size:
+                    return state
+                state_mean = state.mean(dim=0, keepdim=True)
+                return state_mean.expand(batch_size, -1).contiguous()
+            if isinstance(state, (list, tuple)):
+                expanded = [expand_state(item, batch_size) for item in state]
+                return type(state)(expanded)
+            return state
+
         # Flatten if 3D (Batch, Seq, Dim) -> (Batch*Seq, Dim)
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
@@ -257,48 +576,136 @@ class HOPEModel(nn.Module):
         # Replay mixing is handled externally now.
         # update_chunk simply processes the provided input x (which is already mixed).
 
-        encoded = F.relu(self.encoder(x))
-        if self.pre_norm is not None:
-            encoded = self.pre_norm(encoded)
-        if self.conv is not None:
-            if encoded.dim() == 2:
-                encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+        with torch.no_grad():
+            encoded = F.relu(self._chunked_linear(x, self.encoder, chunk_size))
+            if self.pre_norm is not None:
+                encoded = self.pre_norm(encoded)
+            if self.conv is not None:
+                if encoded.dim() == 2:
+                    encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+                else:
+                    encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
+
+            if self.backbone == "attention":
+                modulated = self.attention(encoded)
             else:
-                encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
+                modulated = self.self_mod.update_chunk_and_forward(
+                    encoded,
+                    chunk_size=chunk_size,
+                    memory_chunk_size=memory_chunk_size,
+                    projection_mask=self.self_mod_projection_mask,
+                )
+
+            normed = self.norm(modulated)
+            if self.post_norm is not None:
+                normed = self.post_norm(normed)
 
         # Step E: Update CMS
         # We pass update=True to allow CMS to learn from this mixed batch.
-        # State is reset (None) for mixed/offline update.
-        encoded, _ = self.cms.forward(encoded, time=self.state.time, states=None, update=True)
+        batch_size = normed.size(0)
+        expanded_states = expand_state(self.state.memory, batch_size)
+        with torch.no_grad():
+            memory_context, _ = self.cms.forward(normed, time=self.state.time, states=expanded_states, update=True)
 
         if self.nested_flow is not None:
-            encoded = self.nested_flow.forward(encoded, time=self.state.time, update=True)
-        if self.self_mod is not None:
-            self.self_mod.update_chunk(
-                encoded,
-                chunk_size=chunk_size,
-                memory_chunk_size=memory_chunk_size,
-                projection_mask=self.self_mod_projection_mask,
-            )
+            with torch.no_grad():
+                memory_context = memory_context.detach()
+                memory_context = self.nested_flow.forward(memory_context, time=self.state.time, update=True)
 
-        # Update Decoder Memory in chunk
-        if self.self_mod is not None:
-             modulated = self.self_mod(encoded)
+        task_index = self._select_task(task_id)
+        if self.task_count:
+            decoder_mem = self.decoder_memories[task_index]
         else:
-             modulated = encoded
+            decoder_mem = self.decoder_mem
 
-        normed = self.norm(modulated)
-        if self.post_norm is not None:
-            normed = self.post_norm(normed)
+        # Reset state for chunk update, but preserve mean state if available.
+        dec_state = expand_state(self.state.decoder_memory, memory_context.size(0))
+        if dec_state is None:
+            dec_state = torch.zeros(
+                memory_context.size(0),
+                memory_context.size(1),
+                device=memory_context.device,
+                dtype=memory_context.dtype,
+            )
+        decoder_mem.update(memory_context, dec_state, update=True)
 
-        # Reset state for chunk update
-        dec_state = torch.zeros(normed.size(0), normed.size(1), device=normed.device, dtype=normed.dtype)
-        self.decoder_mem.update(normed, dec_state, update=True)
+    def _iter_cms_blocks(self):
+        if hasattr(self.cms, "blocks"):
+            for block in self.cms.blocks:
+                yield block
+        elif hasattr(self.cms, "systems"):
+            for system in self.cms.systems:
+                for block in system.blocks:
+                    yield block
+
+    def maybe_rescale_cms(
+        self,
+        *,
+        loss: float,
+        accuracy: float | None,
+        dataset_size: int | None,
+        task_count: int | None,
+        batch_size: int | None = None,
+        spike_threshold: float = 0.25,
+        acc_drop: float = 0.05,
+        cooldown_steps: int = 50,
+    ) -> bool:
+        if not dataset_size or not task_count:
+            return False
+
+        loss_value = float(loss)
+        if self._ema_loss is None:
+            self._ema_loss = loss_value
+        else:
+            self._ema_loss = 0.9 * self._ema_loss + 0.1 * loss_value
+
+        if accuracy is not None:
+            if self._ema_acc is None:
+                self._ema_acc = accuracy
+            else:
+                self._ema_acc = 0.9 * self._ema_acc + 0.1 * accuracy
+            if self._best_acc is None or accuracy > self._best_acc:
+                self._best_acc = accuracy
+
+        if self._cms_autoscale_cooldown > 0:
+            self._cms_autoscale_cooldown -= 1
+            return False
+
+        loss_spike = self._ema_loss is not None and loss_value > self._ema_loss * (1.0 + spike_threshold)
+        acc_drop_trigger = False
+        if accuracy is not None and self._best_acc is not None:
+            acc_drop_trigger = accuracy < (self._best_acc - acc_drop)
+
+        if not (loss_spike or acc_drop_trigger):
+            return False
+
+        config = self.auto_scale_cms(
+            dataset_size,
+            task_count,
+            backbone=self.backbone,
+            batch_size=batch_size,
+        )
+        self.cms_chunk_size = config.get("cms_chunk_size", self.cms_chunk_size)
+        self.cms_memory_chunk_size = config.get("cms_memory_chunk_size", self.cms_memory_chunk_size)
+        self._cms_autoscale_cooldown = max(1, cooldown_steps)
+        return True
 
     def self_update_from_logits(self):
         if self._last_context is None or self._last_logits is None or self._last_logits.grad is None:
             return
-        grad_hidden = self._last_logits.grad @ self.decoder.weight.t()
+        if self.self_mod is None:
+            return
+        grad_hidden = None
+        if isinstance(self._last_context, torch.Tensor) and self._last_context.grad is not None:
+            grad_hidden = self._last_context.grad
+        if self.task_count:
+            if self._last_task_id is None:
+                return
+            decoder = self.decoder_heads[self._last_task_id]
+        else:
+            decoder = self.decoder
+        if grad_hidden is None:
+            grad_hidden = self._last_logits.grad @ decoder.weight.t()
         self.self_mod.update_chunk(self._last_context + grad_hidden)
 
     def reset(self):

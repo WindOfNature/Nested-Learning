@@ -35,7 +35,10 @@ class Linear(nn.Module):
 
         if self.use_kernels and not torch.is_grad_enabled():
             if x.is_cuda and gpu_kernels.available().available:
-                out = gpu_kernels.matmul(x, self.weight)
+                if self.bias is not None:
+                    out = gpu_kernels.linear(x, self.weight, self.bias)
+                else:
+                    out = gpu_kernels.matmul(x, self.weight)
             elif not x.is_cuda:
                 out = cpu_kernels.matmul_torch(x, self.weight)
             else:
@@ -84,15 +87,17 @@ class MLP(nn.Module):
 class MemoryMLP(nn.Module):
     """Memory module M□(·) = (·) + W1 σ(W2 (·))."""
 
-    def __init__(self, features: int, hidden_features: int | None = None):
+    def __init__(self, features: int, hidden_features: int | None = None, use_kernels: bool = False):
         super().__init__()
         hidden = hidden_features or features * 2
-        self.fc1 = Linear(features, hidden)
-        self.fc2 = Linear(hidden, features)
+        self.fc1 = Linear(features, hidden, use_kernels=use_kernels)
+        self.fc2 = Linear(hidden, features, use_kernels=use_kernels)
         # Initialize last layer to zero for identity behavior at start
         nn.init.zeros_(self.fc2.weight)
         if self.fc2.bias is not None:
             nn.init.zeros_(self.fc2.bias)
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias)
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -131,7 +136,7 @@ class AssociativeMemory(nn.Module):
         self.register_buffer("memory", torch.zeros(self.value_dim, self.features))
         self.state = AssociativeMemoryState(memory=self.memory, time=0)
         if mode == "parametric":
-            self.memory_net = MemoryMLP(features, hidden_features=features * 2)
+            self.memory_net = MemoryMLP(features, hidden_features=features * 2, use_kernels=False)
         else:
             self.memory_net = None
 
@@ -168,17 +173,17 @@ class AssociativeMemory(nn.Module):
 class AttentionBlock(nn.Module):
     """Softmax attention block used for Hope-Attention variants."""
 
-    def __init__(self, features: int, heads: int = 4, bias: bool = True):
+    def __init__(self, features: int, heads: int = 4, bias: bool = True, use_kernels: bool = False):
         super().__init__()
         if features % heads != 0:
             raise ValueError("features must be divisible by heads")
         self.heads = heads
         self.head_dim = features // heads
         self.scale = self.head_dim**-0.5
-        self.q_proj = Linear(features, features, bias=bias)
-        self.k_proj = Linear(features, features, bias=bias)
-        self.v_proj = Linear(features, features, bias=bias)
-        self.out_proj = Linear(features, features, bias=bias)
+        self.q_proj = Linear(features, features, bias=bias, use_kernels=use_kernels)
+        self.k_proj = Linear(features, features, bias=bias, use_kernels=use_kernels)
+        self.v_proj = Linear(features, features, bias=bias, use_kernels=use_kernels)
+        self.out_proj = Linear(features, features, bias=bias, use_kernels=use_kernels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() == 2:
@@ -208,17 +213,17 @@ class MemorySignals:
 class SelfReferentialTitan(nn.Module):
     """Self-referential module with explicit memories for {k, v, q, eta, alpha, memory}."""
 
-    def __init__(self, features: int, update_hidden: int = 64, query_static: bool = False):
+    def __init__(self, features: int, update_hidden: int = 64, query_static: bool = False, use_kernels: bool = False):
         super().__init__()
-        self.norm = LayerNorm(features)
-        self.mk = MemoryMLP(features, hidden_features=update_hidden)
-        self.mv = MemoryMLP(features, hidden_features=update_hidden)
-        self.mq = MemoryMLP(features, hidden_features=update_hidden)
-        self.meta = MemoryMLP(features, hidden_features=update_hidden)
-        self.malpha = MemoryMLP(features, hidden_features=update_hidden)
-        self.mmemory = MemoryMLP(features, hidden_features=update_hidden)
+        self.norm = LayerNorm(features, use_kernels=use_kernels)
+        self.mk = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
+        self.mv = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
+        self.mq = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
+        self.meta = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
+        self.malpha = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
+        self.mmemory = MemoryMLP(features, hidden_features=update_hidden, use_kernels=use_kernels)
         self.query_static = query_static
-        self.q_proj = Linear(features, features) if query_static else None
+        self.q_proj = Linear(features, features, use_kernels=use_kernels) if query_static else None
         self.scale = nn.Parameter(torch.ones(features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -234,8 +239,8 @@ class SelfReferentialTitan(nn.Module):
         q = self.q_proj(x) if self.q_proj is not None else self.mq(x)
         k = self.mk(x)
         v = self.mv(x)
-        eta = torch.sigmoid(self.meta(x)) * 0.1
-        alpha = torch.sigmoid(self.malpha(x))
+        eta = torch.sigmoid(self.meta(x)) * 0.05
+        alpha = torch.sigmoid(self.malpha(x)).clamp(0.1, 0.9)
         memory = self.mmemory(q)
         return MemorySignals(k=k, v=v, q=q, eta=eta, alpha=alpha, memory=memory)
 
@@ -248,6 +253,8 @@ class SelfReferentialTitan(nn.Module):
     ):
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
+        if eta <= 1e-4:
+            return
 
         v_hat = signals.v.detach()
         if update_projections:
@@ -277,6 +284,7 @@ class SelfReferentialTitan(nn.Module):
         x_l2 = F.normalize(x_ln, p=2, dim=-1)
         return self.generate_signals(x_l2)
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -302,6 +310,35 @@ class SelfReferentialTitan(nn.Module):
             signals = self._compute_signals(chunk)
             self._update_modules(signals, update_memory=True, update_projections=False)
 
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        chunk_size = chunk_size or x.shape[0]
+        memory_chunk_size = memory_chunk_size or chunk_size
+        if chunk_size <= 0 or memory_chunk_size <= 0:
+            raise ValueError("chunk_size and memory_chunk_size must be positive")
+        outputs = []
+        for start in range(0, x.shape[0], chunk_size):
+            chunk = x[start : start + chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(
+                signals,
+                update_memory=False,
+                update_projections=True,
+                projection_mask=projection_mask,
+            )
+            outputs.append(chunk + signals.eta * signals.memory)
+        for start in range(0, x.shape[0], memory_chunk_size):
+            chunk = x[start : start + memory_chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(signals, update_memory=True, update_projections=False)
+        return torch.cat(outputs, dim=0)
+
 
 class SelfModifyingStack(nn.Module):
     """Stacked self-referential titans for deeper self-modifying updates."""
@@ -312,11 +349,17 @@ class SelfModifyingStack(nn.Module):
         depth: int = 2,
         update_hidden: int = 64,
         query_static: bool = False,
+        use_kernels: bool = False,
     ):
         super().__init__()
         self.layers = nn.ModuleList(
             [
-                SelfReferentialTitan(features, update_hidden=update_hidden, query_static=query_static)
+                SelfReferentialTitan(
+                    features,
+                    update_hidden=update_hidden,
+                    query_static=query_static,
+                    use_kernels=use_kernels,
+                )
                 for _ in range(depth)
             ]
         )
@@ -327,6 +370,7 @@ class SelfModifyingStack(nn.Module):
             out = layer(out)
         return out
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -342,6 +386,24 @@ class SelfModifyingStack(nn.Module):
                 projection_mask=projection_mask,
             )
 
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        out = x
+        for layer in self.layers:
+            out = layer.update_chunk_and_forward(
+                out,
+                chunk_size=chunk_size,
+                memory_chunk_size=memory_chunk_size,
+                projection_mask=projection_mask,
+            )
+        return out
+
 
 @dataclass
 class ContextFlowState:
@@ -353,16 +415,16 @@ class ContextFlowState:
 class ContextFlowLevel(nn.Module):
     """Single level of nested context flow with its own optimization dynamics."""
 
-    def __init__(self, features: int, hidden: int = 128):
+    def __init__(self, features: int, hidden: int = 128, use_kernels: bool = False):
         super().__init__()
         self.transform = nn.Sequential(
-            Linear(features, hidden),
+            Linear(features, hidden, use_kernels=use_kernels),
             nn.ReLU(),
-            Linear(hidden, features),
+            Linear(hidden, features, use_kernels=use_kernels),
         )
-        self.norm = LayerNorm(features)
-        self.meta = MemoryMLP(features)
-        self.malpha = MemoryMLP(features)
+        self.norm = LayerNorm(features, use_kernels=use_kernels)
+        self.meta = MemoryMLP(features, use_kernels=use_kernels)
+        self.malpha = MemoryMLP(features, use_kernels=use_kernels)
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
         self.state = ContextFlowState(time=0, level=0, context=torch.zeros(1, features))
 
@@ -370,6 +432,10 @@ class ContextFlowLevel(nn.Module):
         return self.norm(context + self.transform(context))
 
     def update(self, context: torch.Tensor, time: int):
+        if torch.is_grad_enabled() and context.requires_grad:
+            with torch.no_grad():
+                self.state = ContextFlowState(time=time, level=self.state.level, context=context.detach().mean(dim=0, keepdim=True))
+            return
         with torch.enable_grad():
             context_detached = context.detach()
             eta = F.softplus(self.meta(context_detached)).mean().clamp(min=1e-5).item()
@@ -377,8 +443,18 @@ class ContextFlowLevel(nn.Module):
             output = self.forward(context_detached)
             target = context_detached + self.transform(context_detached).detach()
             loss = F.mse_loss(output, target)
-            self.optimizer.zero_grad()
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            grads = torch.autograd.grad(
+                loss,
+                self.parameters(),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for param, grad in zip(self.parameters(), grads):
+                if grad is None:
+                    continue
+                param.grad = grad
             self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
         with torch.no_grad():
             self.state = ContextFlowState(time=time, level=self.state.level, context=output.mean(dim=0, keepdim=True))
@@ -387,9 +463,11 @@ class ContextFlowLevel(nn.Module):
 class NestedContextFlow(nn.Module):
     """Nested multi-level context flow module."""
 
-    def __init__(self, features: int, depth: int = 2, hidden: int = 128):
+    def __init__(self, features: int, depth: int = 2, hidden: int = 128, use_kernels: bool = False):
         super().__init__()
-        self.levels = nn.ModuleList([ContextFlowLevel(features, hidden=hidden) for _ in range(depth)])
+        self.levels = nn.ModuleList(
+            [ContextFlowLevel(features, hidden=hidden, use_kernels=use_kernels) for _ in range(depth)]
+        )
 
     def forward(self, context: torch.Tensor, time: int, update: bool = True) -> torch.Tensor:
         flow = context
