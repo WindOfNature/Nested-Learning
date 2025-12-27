@@ -54,22 +54,22 @@ are automatically used during inference when gradients are disabled.
 
 ## Quickstarts
 
-### A) HOPE (Titans backbone)
+### A) HOPE (Titans adaptive preset)
 
 ```python
 import torch
 from nested_learning.hope import HOPEModel
 
-model = HOPEModel(
+model = HOPEModel.from_preset(
     input_dim=64,
     hidden_dim=128,
     output_dim=10,
-    frequencies=[1, 4, 16],
-    cms_variant="nested",
-    self_mod_depth=3,
-    nested_depth=2,
-    memory_decay=0.1,
-    replay_ratio=0.2,
+    preset="adaptive",
+    dataset_size=10_000,
+    task_count=4,
+    frequencies=[1, 8, 16, 32, 64],
+    cms_depth=2,
+    cms_memory_chunk_size=16,
     backbone="titans",
 )
 
@@ -77,18 +77,21 @@ x = torch.randn(8, 64)
 logits = model(x, time=0)
 ```
 
-### B) Hope-Attention
+### B) Hope-Attention (explicit CMS config)
 
 ```python
 import torch
 from nested_learning.hope import HOPEModel
 
-model = HOPEModel(
+model = HOPEModel.from_preset(
     input_dim=64,
     hidden_dim=128,
     output_dim=10,
-    frequencies=[1, 4, 16],
-    cms_variant="nested",
+    preset="balanced",
+    dataset_size=10_000,
+    task_count=4,
+    frequencies=[1, 2, 4, 8],
+    cms_depth=2,
     backbone="attention",
 )
 
@@ -100,13 +103,10 @@ logits = model(x, time=0)
 
 ```bash
 PYTHONPATH=. python examples/continual_digits.py \
-  --epochs 2 \
-  --batch-size 32 \
+  --preset adaptive \
   --max-samples 500 \
-  --chunk-size 4 \
-  --memory-chunk-size 8 \
-  --steered-optim \
-  --precondition outer
+  --cms-depth 2 \
+  --cms-memory-chunk-size 16
 ```
 
 ### D) CMS multi-level frequencies
@@ -185,7 +185,9 @@ HOPEModel(
     input_dim: int,
     hidden_dim: int,
     output_dim: int,
+    task_count: int | None = None,
     frequencies: list[int] | None,
+    cms_depth: int = 2,
     cms_variant: str = "nested",  # nested | sequential | headwise | chain
     self_mod_depth: int = 2,
     heads: int = 4,
@@ -198,7 +200,7 @@ HOPEModel(
     nested_hidden: int = 128,
     memory_decay: float = 0.0,
     replay_ratio: float = 0.0,
-    replay_steps: int = 1,
+    replay_steps: int = 0,
     replay_buffer: int = 128,
     use_conv: bool = True,
     conv_kernel: int = 3,
@@ -207,10 +209,50 @@ HOPEModel(
 )
 ```
 
-- `forward(x, time, update_memory=True)`
-- `update_chunk(x, chunk_size=None, memory_chunk_size=None)`
+- `forward(x, time, update_memory=True, task_id=None, detach_encoder=False)`
+- `update_chunk(x, chunk_size=None, memory_chunk_size=None, task_id=None)`
 - `self_update_from_logits()`
 
+### `HOPEModel.from_preset`
+
+```python
+HOPEModel.from_preset(
+    input_dim: int,
+    hidden_dim: int,
+    output_dim: int,
+    preset: str = "balanced",  # adaptive | balanced | fast_adapt | high_retention
+    dataset_size: int | None = None,
+    task_count: int | None = None,
+    auto_scale: bool = True,
+    **overrides,
+)
+```
+
+The preset path reduces the number of knobs for most users. Advanced overrides
+(e.g., `frequencies`, `replay_ratio`, `self_mod_depth`) are still available but
+not required for a solid baseline.
+
+### Presets & Auto-scale (recommended)
+
+If you don’t want to tune hyperparameters, use `preset="adaptive"` with
+`auto_scale=True`. Auto-scaling adapts replay buffer size, replay ratio, memory
+decay, and (for Titans) **CMS chunk sizes** based on dataset size and task
+count. CMS frequencies/depth/memory chunk size remain explicit so you can
+control the multi-timescale ladder directly.
+
+> Note: Presets default to **no replay**. Replay is only active if you pass
+> non-zero `replay_ratio` and `replay_weight` in your training code.
+
+### CMS Hyperparameters
+
+`frequencies` defines the CMS update rates (Eq. 70–71 in the paper). `cms_depth`
+controls the per-level MLP depth inside each memory block. The adaptive preset
+auto-scales CMS **chunk sizes** for Titans, but keeps `frequencies`, `cms_depth`,
+and `cms_memory_chunk_size` explicit so you can tune the update ladder. You can
+override any of them via `--cms-*` flags or constructor arguments.
+
+`hope_levels` + `lowest_frequency` can still be used as a convenience to generate
+frequencies, but non-adaptive presets expect explicit CMS configuration.
 ---
 
 ## Optimizer State Persistence (Continual Learning)
@@ -229,13 +271,12 @@ load_optimizer_state(optimizer, "optim_state.pt")
 Example run (as in the paper’s continual-learning style setup):
 
 ```
-Task A accuracy before: 0.287
-Task B accuracy: 0.228
-Task A accuracy after: 0.287
-Forgetting: 0.000
+Task A accuracy before: 1.000
+Task B accuracy: 0.961
+Task A accuracy after: 0.967
+Forgetting: 0.033
 ```
-* Accuracy is low because HOPE is not designed for vision task and this current implementation only uses a 128 dim, no CNN
-* and this was ran on only 200 max samples.
+* Accuracy is shown for the adaptive preset + auto-scale settings using 500 max samples (replay disabled).
 ---
 
 ## Package Layout
