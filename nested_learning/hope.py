@@ -465,6 +465,19 @@ class HOPEModel(nn.Module):
         memory_chunk_size: int | None = None,
         task_id: int | None = None,
     ):
+        def expand_state(state, batch_size: int):
+            if state is None:
+                return None
+            if isinstance(state, torch.Tensor):
+                if state.size(0) == batch_size:
+                    return state
+                state_mean = state.mean(dim=0, keepdim=True)
+                return state_mean.expand(batch_size, -1).contiguous()
+            if isinstance(state, (list, tuple)):
+                expanded = [expand_state(item, batch_size) for item in state]
+                return type(state)(expanded)
+            return state
+
         # Flatten if 3D (Batch, Seq, Dim) -> (Batch*Seq, Dim)
         if x.dim() == 3:
             x = x.view(-1, x.shape[-1])
@@ -472,42 +485,44 @@ class HOPEModel(nn.Module):
         # Replay mixing is handled externally now.
         # update_chunk simply processes the provided input x (which is already mixed).
 
-        encoded = F.relu(self.encoder(x))
-        if self.pre_norm is not None:
-            encoded = self.pre_norm(encoded)
-        if self.conv is not None:
-            if encoded.dim() == 2:
-                encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+        with torch.no_grad():
+            encoded = F.relu(self.encoder(x))
+            if self.pre_norm is not None:
+                encoded = self.pre_norm(encoded)
+            if self.conv is not None:
+                if encoded.dim() == 2:
+                    encoded = self.conv(encoded.unsqueeze(-1)).squeeze(-1)
+                else:
+                    encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
+
+            if self.self_mod is not None:
+                self.self_mod.update_chunk(
+                    encoded,
+                    chunk_size=chunk_size,
+                    memory_chunk_size=memory_chunk_size,
+                    projection_mask=self.self_mod_projection_mask,
+                )
+
+            if self.backbone == "attention":
+                modulated = self.attention(encoded)
             else:
-                encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
+                modulated = self.self_mod(encoded)
 
-        encoded = encoded.detach()
-
-        if self.self_mod is not None:
-            self.self_mod.update_chunk(
-                encoded,
-                chunk_size=chunk_size,
-                memory_chunk_size=memory_chunk_size,
-                projection_mask=self.self_mod_projection_mask,
-            )
-
-        if self.backbone == "attention":
-            modulated = self.attention(encoded)
-        else:
-            modulated = self.self_mod(encoded)
-
-        normed = self.norm(modulated)
-        if self.post_norm is not None:
-            normed = self.post_norm(normed)
+            normed = self.norm(modulated)
+            if self.post_norm is not None:
+                normed = self.post_norm(normed)
 
         # Step E: Update CMS
         # We pass update=True to allow CMS to learn from this mixed batch.
-        # State is reset (None) for mixed/offline update.
-        memory_context, _ = self.cms.forward(normed, time=self.state.time, states=None, update=True)
+        batch_size = normed.size(0)
+        expanded_states = expand_state(self.state.memory, batch_size)
+        with torch.no_grad():
+            memory_context, _ = self.cms.forward(normed, time=self.state.time, states=expanded_states, update=True)
 
         if self.nested_flow is not None:
-            memory_context = memory_context.detach()
-            memory_context = self.nested_flow.forward(memory_context, time=self.state.time, update=True)
+            with torch.no_grad():
+                memory_context = memory_context.detach()
+                memory_context = self.nested_flow.forward(memory_context, time=self.state.time, update=True)
 
         task_index = self._select_task(task_id)
         if self.task_count:
@@ -515,13 +530,15 @@ class HOPEModel(nn.Module):
         else:
             decoder_mem = self.decoder_mem
 
-        # Reset state for chunk update
-        dec_state = torch.zeros(
-            memory_context.size(0),
-            memory_context.size(1),
-            device=memory_context.device,
-            dtype=memory_context.dtype,
-        )
+        # Reset state for chunk update, but preserve mean state if available.
+        dec_state = expand_state(self.state.decoder_memory, memory_context.size(0))
+        if dec_state is None:
+            dec_state = torch.zeros(
+                memory_context.size(0),
+                memory_context.size(1),
+                device=memory_context.device,
+                dtype=memory_context.dtype,
+            )
         decoder_mem.update(memory_context, dec_state, update=True)
 
     def _iter_cms_blocks(self):

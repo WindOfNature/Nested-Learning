@@ -95,50 +95,53 @@ class MemoryBlock(nn.Module):
             return out, new_hidden
         # We need to perform optimization step.
 
-        # Loss for weight update (Local Reconstruction)
-        # We must NOT backprop to eta (Meta) OR x (Encoder) here.
-        # Local loss should only update the Memory Content weights (layers).
+        with torch.enable_grad():
+            # Loss for weight update (Local Reconstruction)
+            # We must NOT backprop to eta (Meta) OR x (Encoder) here.
+            # Local loss should only update the Memory Content weights (layers).
 
-        x_det = x.detach()
-        # Recompute mem with detached input using same normalization
-        x_ln = self.norm(x_det)
-        x_l2 = F.normalize(x_ln, p=2, dim=-1)
+            x_det = x.detach()
+            # Recompute mem with detached input using same normalization
+            x_ln = self.norm(x_det)
+            x_l2 = F.normalize(x_ln, p=2, dim=-1)
 
-        mem_local = x_l2
-        for layer in self.layers:
-            mem_local = F.relu(layer(mem_local))
-        # No output norm
+            mem_local = x_l2
+            for layer in self.layers:
+                mem_local = F.relu(layer(mem_local))
+            # No output norm
 
-        alpha_local = alpha_tensor.detach()
-        hidden_det = hidden_state.detach()
-        mem_local = alpha_local * hidden_det + (1.0 - alpha_local) * mem_local
+            alpha_local = alpha_tensor.detach()
+            hidden_det = hidden_state.detach()
+            mem_local = alpha_local * hidden_det + (1.0 - alpha_local) * mem_local
 
-        # Reconstruct memory content locally (L2 regression)
-        # The memory block is trained to map normalized inputs to normalized targets.
-        loss = F.mse_loss(mem_local, x_l2)
+            # Reconstruct memory content locally (L2 regression).
+            # Blend the target with retained hidden state to reduce overwrite.
+            target = alpha_local * hidden_det + (1.0 - alpha_local) * x_l2
+            loss = F.mse_loss(mem_local, target)
 
-        if self.replay_ratio > 0.0 and self.replay_buffer:
-            replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
-            if len(self.replay_buffer) >= replay_count:
-                for _ in range(max(1, self.replay_steps)):
-                    # Buffer stores samples (Tensor[Dim])
-                    replay_samples = random.sample(self.replay_buffer, replay_count)
-                    replay_batch = torch.stack(replay_samples, dim=0)
+            if self.replay_ratio > 0.0 and self.replay_buffer:
+                replay_count = max(1, int(self.replay_ratio * len(self.replay_buffer)))
+                if len(self.replay_buffer) >= replay_count:
+                    for _ in range(max(1, self.replay_steps)):
+                        # Buffer stores samples (Tensor[Dim])
+                        replay_samples = random.sample(self.replay_buffer, replay_count)
+                        replay_batch = torch.stack(replay_samples, dim=0)
 
-                    # Replay memory content regression using detached inputs.
-                    replay_ln = self.norm(replay_batch)
-                    replay_l2 = F.normalize(replay_ln, p=2, dim=-1)
-                    replay_mem = replay_l2
-                    for layer in self.layers:
-                        replay_mem = F.relu(layer(replay_mem))
-                    alpha_replay = torch.sigmoid(self.malpha(replay_l2)).detach()
-                    replay_mem = alpha_replay * torch.zeros_like(replay_mem) + (1.0 - alpha_replay) * replay_mem
-                    loss = loss + F.mse_loss(replay_mem, replay_l2)
+                        # Replay memory content regression using detached inputs.
+                        replay_ln = self.norm(replay_batch)
+                        replay_l2 = F.normalize(replay_ln, p=2, dim=-1)
+                        replay_mem = replay_l2
+                        for layer in self.layers:
+                            replay_mem = F.relu(layer(replay_mem))
+                        alpha_replay = torch.sigmoid(self.malpha(replay_l2)).detach()
+                        replay_target = alpha_replay * torch.zeros_like(replay_mem) + (1.0 - alpha_replay) * replay_l2
+                        replay_mem = alpha_replay * torch.zeros_like(replay_mem) + (1.0 - alpha_replay) * replay_mem
+                        loss = loss + F.mse_loss(replay_mem, replay_target)
 
-        self.optimizer.zero_grad(set_to_none=True)
-        grads = torch.autograd.grad(loss, self.fast_params, retain_graph=False, create_graph=False)
-        for param, grad in zip(self.fast_params, grads):
-            param.grad = grad
+            self.optimizer.zero_grad(set_to_none=True)
+            grads = torch.autograd.grad(loss, self.fast_params, retain_graph=False, create_graph=False)
+            for param, grad in zip(self.fast_params, grads):
+                param.grad = grad
 
         # Extract scalar values for optimizer (or mean)
         eta_val = eta_tensor.mean().item()

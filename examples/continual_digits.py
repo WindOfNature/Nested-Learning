@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 
 import numpy as np
+import time
 import torch
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
@@ -68,12 +69,12 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
 def train_task(
     model: HOPEModel,
     optimizer: torch.optim.Optimizer,
-    x: np.ndarray,
-    y: np.ndarray,
+    x: torch.Tensor,
+    y: torch.Tensor,
     epochs: int,
     batch_size: int,
     device: torch.device,
-    rng: np.random.Generator,
+    rng: torch.Generator,
     cms_chunk_size: int,
     cms_memory_chunk_size: int,
     task_id: int,
@@ -87,13 +88,13 @@ def train_task(
     model.train()
     global_step = 0
     for epoch in range(epochs):
-        indices = rng.permutation(len(x))
+        indices = torch.randperm(x.size(0), generator=rng, device=x.device)
         chunk_buffer = []
         for step in range(0, len(indices), batch_size):
             global_step += 1
             batch_idx = indices[step : step + batch_size]
-            batch_x = torch.tensor(x[batch_idx], device=device)
-            batch_y = torch.tensor(y[batch_idx], device=device)
+            batch_x = x[batch_idx]
+            batch_y = y[batch_idx]
 
             # 1. Remember new data
             model.remember(batch_x, batch_y, task_id=task_id)
@@ -170,8 +171,8 @@ def train_task(
 
 def evaluate(
     model: HOPEModel,
-    x: np.ndarray,
-    y: np.ndarray,
+    x: torch.Tensor,
+    y: torch.Tensor,
     batch_size: int,
     device: torch.device,
     task_id: int,
@@ -179,13 +180,13 @@ def evaluate(
     model.eval()
     correct = 0
     with torch.no_grad():
-        for step in range(0, len(x), batch_size):
-            batch_x = torch.tensor(x[step : step + batch_size], device=device)
-            batch_y = torch.tensor(y[step : step + batch_size], device=device)
+        for step in range(0, x.size(0), batch_size):
+            batch_x = x[step : step + batch_size]
+            batch_y = y[step : step + batch_size]
             logits = model.forward(batch_x, time=step, update_memory=False, task_id=task_id)
             preds = logits.argmax(dim=-1)
             correct += int((preds == batch_y).sum().item())
-    return correct / len(x)
+    return correct / x.size(0)
 
 
 def main():
@@ -233,10 +234,9 @@ def main():
     if args.cms_frequencies:
         args.cms_frequencies = [int(item.strip()) for item in args.cms_frequencies.split(",") if item.strip()]
 
-    rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed)
-
     device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    rng = torch.Generator(device=device).manual_seed(args.seed)
 
     (xa, ya), (xb, yb) = prepare_tasks()
     xa_train, xa_test, ya_train, ya_test = train_test_split(xa, ya, test_size=0.2, random_state=42)
@@ -259,6 +259,15 @@ def main():
         raise ValueError("CMS frequencies, depth, and memory chunk size are required")
     if args.cms_chunk_size is None and not (args.preset == "adaptive" and args.auto_scale):
         raise ValueError("CMS chunk size is required unless using preset='adaptive' with auto-scale")
+
+    xa_train = torch.tensor(xa_train, device=device)
+    ya_train = torch.tensor(ya_train, device=device)
+    xa_test = torch.tensor(xa_test, device=device)
+    ya_test = torch.tensor(ya_test, device=device)
+    xb_train = torch.tensor(xb_train, device=device)
+    yb_train = torch.tensor(yb_train, device=device)
+    xb_test = torch.tensor(xb_test, device=device)
+    yb_test = torch.tensor(yb_test, device=device)
 
     if args.preset != "custom":
         model = HOPEModel.from_preset(
@@ -316,6 +325,7 @@ def main():
     task_b_epochs = args.task_b_epochs if args.task_b_epochs is not None else args.epochs
     dynamic_cms = args.preset == "adaptive" and args.auto_scale
 
+    train_start = time.perf_counter()
     train_task(
         model,
         optimizer,
@@ -368,6 +378,7 @@ def main():
         batch_size_value=args.batch_size,
         dynamic_cms=dynamic_cms,
     )
+    train_end = time.perf_counter()
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)
     acc_a_after = evaluate(model, xa_test, ya_test, batch_size=args.batch_size, device=device, task_id=0)
 
@@ -375,6 +386,7 @@ def main():
     print(f"Task B accuracy: {acc_b:.3f}")
     print(f"Task A accuracy after: {acc_a_after:.3f}")
     print(f"Forgetting: {acc_a_before - acc_a_after:.3f}")
+    print(f"Total training time: {train_end - train_start:.2f}s")
 
 
 if __name__ == "__main__":
