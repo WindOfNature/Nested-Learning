@@ -59,10 +59,7 @@ def matmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 def matmul_torch(a, b):
     if torch is None:
         raise RuntimeError("torch is required for matmul_torch")
-    a_np = a.detach().cpu().numpy()
-    b_np = b.detach().cpu().numpy()
-    out = matmul(a_np, b_np)
-    return torch.from_numpy(out).to(a.device)
+    return torch.matmul(a, b)
 
 
 if njit:
@@ -91,8 +88,4 @@ def layernorm(x: np.ndarray, gamma: np.ndarray, beta: np.ndarray, eps: float = 1
 def layernorm_torch(x, gamma, beta, eps: float = 1e-5):
     if torch is None:
         raise RuntimeError("torch is required for layernorm_torch")
-    x_np = x.detach().cpu().numpy()
-    gamma_np = gamma.detach().cpu().numpy()
-    beta_np = beta.detach().cpu().numpy()
-    out = layernorm(x_np, gamma_np, beta_np, eps)
-    return torch.from_numpy(out).to(x.device)
+    return torch.nn.functional.layer_norm(x, (x.shape[-1],), gamma, beta, eps)
