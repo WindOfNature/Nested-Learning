@@ -35,7 +35,10 @@ class Linear(nn.Module):
 
         if self.use_kernels and not torch.is_grad_enabled():
             if x.is_cuda and gpu_kernels.available().available:
-                out = gpu_kernels.matmul(x, self.weight)
+                if self.bias is not None:
+                    out = gpu_kernels.linear(x, self.weight, self.bias)
+                else:
+                    out = gpu_kernels.matmul(x, self.weight)
             elif not x.is_cuda:
                 out = cpu_kernels.matmul_torch(x, self.weight)
             else:
@@ -93,6 +96,8 @@ class MemoryMLP(nn.Module):
         nn.init.zeros_(self.fc2.weight)
         if self.fc2.bias is not None:
             nn.init.zeros_(self.fc2.bias)
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias)
         self.optimizer = DGD(self.parameters(), lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -248,6 +253,8 @@ class SelfReferentialTitan(nn.Module):
     ):
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
+        if eta <= 1e-4:
+            return
 
         v_hat = signals.v.detach()
         if update_projections:
@@ -277,6 +284,7 @@ class SelfReferentialTitan(nn.Module):
         x_l2 = F.normalize(x_ln, p=2, dim=-1)
         return self.generate_signals(x_l2)
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -301,6 +309,35 @@ class SelfReferentialTitan(nn.Module):
             chunk = x[start : start + memory_chunk_size]
             signals = self._compute_signals(chunk)
             self._update_modules(signals, update_memory=True, update_projections=False)
+
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        chunk_size = chunk_size or x.shape[0]
+        memory_chunk_size = memory_chunk_size or chunk_size
+        if chunk_size <= 0 or memory_chunk_size <= 0:
+            raise ValueError("chunk_size and memory_chunk_size must be positive")
+        outputs = []
+        for start in range(0, x.shape[0], chunk_size):
+            chunk = x[start : start + chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(
+                signals,
+                update_memory=False,
+                update_projections=True,
+                projection_mask=projection_mask,
+            )
+            outputs.append(chunk + signals.eta * signals.memory)
+        for start in range(0, x.shape[0], memory_chunk_size):
+            chunk = x[start : start + memory_chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(signals, update_memory=True, update_projections=False)
+        return torch.cat(outputs, dim=0)
 
 
 class SelfModifyingStack(nn.Module):
@@ -327,6 +364,7 @@ class SelfModifyingStack(nn.Module):
             out = layer(out)
         return out
 
+    @torch.no_grad()
     def update_chunk(
         self,
         x: torch.Tensor,
@@ -341,6 +379,24 @@ class SelfModifyingStack(nn.Module):
                 memory_chunk_size=memory_chunk_size,
                 projection_mask=projection_mask,
             )
+
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        out = x
+        for layer in self.layers:
+            out = layer.update_chunk_and_forward(
+                out,
+                chunk_size=chunk_size,
+                memory_chunk_size=memory_chunk_size,
+                projection_mask=projection_mask,
+            )
+        return out
 
 
 @dataclass
@@ -370,6 +426,10 @@ class ContextFlowLevel(nn.Module):
         return self.norm(context + self.transform(context))
 
     def update(self, context: torch.Tensor, time: int):
+        if torch.is_grad_enabled() and context.requires_grad:
+            with torch.no_grad():
+                self.state = ContextFlowState(time=time, level=self.state.level, context=context.detach().mean(dim=0, keepdim=True))
+            return
         with torch.enable_grad():
             context_detached = context.detach()
             eta = F.softplus(self.meta(context_detached)).mean().clamp(min=1e-5).item()
@@ -377,8 +437,18 @@ class ContextFlowLevel(nn.Module):
             output = self.forward(context_detached)
             target = context_detached + self.transform(context_detached).detach()
             loss = F.mse_loss(output, target)
-            self.optimizer.zero_grad()
-            loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            grads = torch.autograd.grad(
+                loss,
+                self.parameters(),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            for param, grad in zip(self.parameters(), grads):
+                if grad is None:
+                    continue
+                param.grad = grad
             self.optimizer.step(lr_override=eta, weight_decay_override=alpha)
         with torch.no_grad():
             self.state = ContextFlowState(time=time, level=self.state.level, context=output.mean(dim=0, keepdim=True))
