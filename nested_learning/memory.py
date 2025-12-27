@@ -93,6 +93,12 @@ class MemoryBlock(nn.Module):
             return out, new_hidden
         if torch.is_grad_enabled() and x.requires_grad:
             return out, new_hidden
+        eta_val = eta_tensor.mean().item()
+        alpha_val = alpha_tensor.mean().item()
+        if eta_val <= 1e-4:
+            if self.replay_ratio > 0.0:
+                self.replay_buffer.extend(x.detach().unbind(0))
+            return out, new_hidden
         # We need to perform optimization step.
 
         with torch.enable_grad():
@@ -142,10 +148,6 @@ class MemoryBlock(nn.Module):
             grads = torch.autograd.grad(loss, self.fast_params, retain_graph=False, create_graph=False)
             for param, grad in zip(self.fast_params, grads):
                 param.grad = grad
-
-        # Extract scalar values for optimizer (or mean)
-        eta_val = eta_tensor.mean().item()
-        alpha_val = alpha_tensor.mean().item()
 
         # Fix retention logic: decay = (1.0 - alpha) * scale
         # Hard Retention: Lock neurons if alpha > 0.9

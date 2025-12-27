@@ -317,12 +317,18 @@ def main():
         model.cms_chunk_size = args.cms_chunk_size
     if model.cms_memory_chunk_size is None:
         model.cms_memory_chunk_size = args.cms_memory_chunk_size
+
+    fast_param_ids = set()
+    for module in model.modules():
+        if hasattr(module, "fast_params"):
+            fast_param_ids.update(id(param) for param in module.fast_params)
+    slow_params = [param for param in model.parameters() if id(param) not in fast_param_ids]
     base_optimizer = torch.optim.AdamW
     if args.steered_optim:
         config = SteeredOptimizerConfig(precondition=args.precondition, weight_decay=1e-3)
-        optimizer = ContextSteeredOptimizer(model.parameters(), base_optimizer, config=config, lr=1e-3)
+        optimizer = ContextSteeredOptimizer(slow_params, base_optimizer, config=config, lr=1e-3)
     else:
-        optimizer = base_optimizer(model.parameters(), lr=1e-3, weight_decay=1e-3)
+        optimizer = base_optimizer(slow_params, lr=1e-3, weight_decay=1e-3)
 
     task_a_epochs = args.task_a_epochs if args.task_a_epochs is not None else args.epochs
     task_b_epochs = args.task_b_epochs if args.task_b_epochs is not None else args.epochs

@@ -35,7 +35,10 @@ class Linear(nn.Module):
 
         if self.use_kernels and not torch.is_grad_enabled():
             if x.is_cuda and gpu_kernels.available().available:
-                out = gpu_kernels.matmul(x, self.weight)
+                if self.bias is not None:
+                    out = gpu_kernels.linear(x, self.weight, self.bias)
+                else:
+                    out = gpu_kernels.matmul(x, self.weight)
             elif not x.is_cuda:
                 out = cpu_kernels.matmul_torch(x, self.weight)
             else:
@@ -248,6 +251,8 @@ class SelfReferentialTitan(nn.Module):
     ):
         eta = signals.eta.mean().clamp(min=1e-5).item()
         alpha = signals.alpha.mean().clamp(min=1e-5).item()
+        if eta <= 1e-4:
+            return
 
         v_hat = signals.v.detach()
         if update_projections:
