@@ -93,7 +93,7 @@ class HOPEModel(nn.Module):
         if not dataset_size or not task_count:
             return {}
 
-        min_chunk_size = 32
+        min_chunk_size = 64
         if batch_size:
             min_chunk_size = max(min_chunk_size, batch_size)
         if backbone == "attention":
@@ -396,6 +396,8 @@ class HOPEModel(nn.Module):
         detach_encoder: bool = False,
         state: HopeState | None = None,
     ) -> tuple[torch.Tensor, List[Any], torch.Tensor]:
+        if update_memory and torch.is_grad_enabled():
+            update_memory = False
         encoded = F.relu(self.encoder(x))
         if detach_encoder:
             encoded = encoded.detach()
@@ -410,15 +412,16 @@ class HOPEModel(nn.Module):
         if self.backbone == "attention":
             modulated = self.attention(encoded)
         else:
-            if update_memory and not torch.is_grad_enabled():
+            if update_memory:
                 chunk_size = self.cms_chunk_size or encoded.size(0)
                 memory_chunk = self.cms_memory_chunk_size or chunk_size
-                self.self_mod.update_chunk(
-                    encoded,
-                    chunk_size=chunk_size,
-                    memory_chunk_size=memory_chunk,
-                    projection_mask=self.self_mod_projection_mask,
-                )
+                with torch.no_grad():
+                    self.self_mod.update_chunk_and_forward(
+                        encoded.detach(),
+                        chunk_size=chunk_size,
+                        memory_chunk_size=memory_chunk,
+                        projection_mask=self.self_mod_projection_mask,
+                    )
             modulated = self.self_mod(encoded)
         normed = self.norm(modulated)
         if self.post_norm is not None:
@@ -445,23 +448,41 @@ class HOPEModel(nn.Module):
                 chunk = normed[start : start + chunk_size]
                 if not check_batch_dim(current_states, chunk.size(0)):
                     current_states = None
+                if torch.is_grad_enabled():
+                    with torch.no_grad():
+                        memory_context, new_cms_states = self.cms.forward(
+                            chunk.detach(),
+                            time,
+                            states=current_states,
+                            update=True,
+                        )
+                        if self.nested_flow is not None:
+                            memory_context = self.nested_flow.forward(memory_context, time, update=True)
                 memory_context, new_cms_states = self.cms.forward(
                     chunk,
                     time,
                     states=current_states,
-                    update=True,
+                    update=False,
                 )
                 if self.nested_flow is not None:
-                    memory_context = self.nested_flow.forward(memory_context, time, update=True)
+                    memory_context = self.nested_flow.forward(memory_context, time, update=False)
                 memory_chunks.append(memory_context)
                 current_states = new_cms_states
             memory_context = torch.cat(memory_chunks, dim=0)
         else:
             if not check_batch_dim(current_states, normed.size(0)):
                 current_states = None
-            memory_context, new_cms_states = self.cms.forward(normed, time, states=current_states, update=update_memory)
+            if update_memory and torch.is_grad_enabled():
+                with torch.no_grad():
+                    mem_ctx, _ = self.cms.forward(normed.detach(), time, states=current_states, update=True)
+                    if self.nested_flow is not None:
+                        self.nested_flow.forward(mem_ctx, time, update=True)
+                update_flag = False
+            else:
+                update_flag = update_memory
+            memory_context, new_cms_states = self.cms.forward(normed, time, states=current_states, update=update_flag)
             if self.nested_flow is not None:
-                memory_context = self.nested_flow.forward(memory_context, time, update=update_memory)
+                memory_context = self.nested_flow.forward(memory_context, time, update=update_flag)
 
         return memory_context, new_cms_states, encoded
 
@@ -492,7 +513,16 @@ class HOPEModel(nn.Module):
                 dtype=memory_context.dtype,
             )
 
-        normed_mem, new_dec_state = decoder_mem.update(memory_context, dec_state, update=update_memory)
+        if update_memory and torch.is_grad_enabled():
+            with torch.no_grad():
+                _, new_dec_state = decoder_mem.update(
+                    memory_context.detach(),
+                    dec_state.detach() if isinstance(dec_state, torch.Tensor) else dec_state,
+                    update=True,
+                )
+            normed_mem, _ = decoder_mem.update(memory_context, dec_state, update=False)
+        else:
+            normed_mem, new_dec_state = decoder_mem.update(memory_context, dec_state, update=update_memory)
         logits = decoder(self.final_norm(normed_mem))
         return logits, new_dec_state, task_index
 

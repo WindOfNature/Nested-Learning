@@ -46,7 +46,7 @@ def apply_presets(args: argparse.Namespace, dataset_size: int, task_count: int) 
         if args.memory_decay == 0.0:
             args.memory_decay = auto_config.get("memory_decay", args.memory_decay)
         if args.replay_ratio > 0.0:
-            args.replay_weight = min(0.8, 0.2 + 0.1 * task_count)
+            args.replay_weight = 0.5
         if args.task_b_epochs is None:
             args.task_b_epochs = max(args.epochs, 10)
 
@@ -88,8 +88,6 @@ def train_task(
     task_count: int,
     batch_size_value: int,
     dynamic_cms: bool,
-    acc_monitor=None,
-    acc_floor: float | None = None,
 ):
     def detach_state(state):
         if state is None:
@@ -145,13 +143,13 @@ def train_task(
                 current_features, new_cms_states, _ = model.forward_features(
                     batch_x,
                     time=global_step,
-                    update_memory=True,
+                    update_memory=False,
                     state=running_state,
                 )
                 logits_current, new_dec_state, _ = model.forward_decoder(
                     current_features,
                     task_id=task_id,
-                    update_memory=True,
+                    update_memory=False,
                     state=running_state,
                 )
                 loss_current = torch.nn.functional.cross_entropy(logits_current, batch_y)
@@ -160,13 +158,13 @@ def train_task(
                 current_features, new_cms_states, _ = model.forward_features(
                     batch_x,
                     time=global_step,
-                    update_memory=True,
+                    update_memory=False,
                     state=running_state,
                 )
                 logits_current, new_dec_state, _ = model.forward_decoder(
                     current_features,
                     task_id=task_id,
-                    update_memory=True,
+                    update_memory=False,
                     state=running_state,
                 )
                 loss = torch.nn.functional.cross_entropy(logits_current, batch_y)
@@ -185,30 +183,26 @@ def train_task(
                     task_count=task_count,
                     batch_size=batch_size_value,
                 )
-            if acc_monitor is not None and acc_floor is not None and global_step % (batch_size * 4) == 0:
-                monitored = acc_monitor()
-                if monitored < acc_floor:
-                    replay_weight = min(0.8, replay_weight * 2.0)
-                    for group in optimizer.param_groups:
-                        group["lr"] = max(1e-4, group["lr"] * 0.5)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            if model.self_mod is not None:
+            if model.backbone == "titans":
                 with torch.no_grad():
-                    encoded_update = torch.relu(model.encoder(batch_x))
-                    if model.pre_norm is not None:
-                        encoded_update = model.pre_norm(encoded_update)
-                    if model.conv is not None:
-                        encoded_update = model.conv(encoded_update.unsqueeze(-1)).squeeze(-1)
-                    model.self_mod.update_chunk(
-                        encoded_update,
-                        chunk_size=model.cms_chunk_size or batch_x.size(0),
-                        memory_chunk_size=model.cms_memory_chunk_size or batch_x.size(0),
-                        projection_mask=model.self_mod_projection_mask,
+                    current_features, _, _ = model.forward_features(
+                        batch_x,
+                        time=global_step,
+                        update_memory=True,
+                        state=running_state,
                     )
+                    model.forward_decoder(
+                        current_features,
+                        task_id=task_id,
+                        update_memory=True,
+                        state=running_state,
+                    )
+
 
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()
@@ -431,15 +425,6 @@ def main():
         task_count=2,
         batch_size_value=args.batch_size,
         dynamic_cms=dynamic_cms,
-        acc_monitor=lambda: evaluate(
-            model,
-            xa_test,
-            ya_test,
-            batch_size=args.batch_size,
-            device=device,
-            task_id=0,
-        ),
-        acc_floor=acc_a_before,
     )
     train_end = time.perf_counter()
     acc_b = evaluate(model, xb_test, yb_test, batch_size=args.batch_size, device=device, task_id=1)

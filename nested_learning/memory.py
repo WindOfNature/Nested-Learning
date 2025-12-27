@@ -45,7 +45,7 @@ class MemoryBlock(nn.Module):
         # Only optimize memory content parameters (layers, norm) in the inner loop.
         # Meta-parameters (meta, malpha) are optimized by the outer loop (Task Loss).
         self.fast_params = list(self.layers.parameters()) + list(self.norm.parameters())
-        self.optimizer = DGD(self.fast_params, lr=5e-4, beta=0.9, alpha=0.5, weight_decay=1e-4)
+        self.optimizer = DGD(self.fast_params, lr=1e-3, beta=0.9, alpha=0.5, weight_decay=1e-4)
         self.step_counter = 0
 
     def forward(self, x: torch.Tensor, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -94,8 +94,6 @@ class MemoryBlock(nn.Module):
         if torch.is_grad_enabled() and x.requires_grad:
             return out, new_hidden
         eta_val = eta_tensor.mean().item()
-        lr_scale = max(0.25, min(4.0, 1.0 / max(1.0, float(self.frequency))))
-        eta_val *= lr_scale
         alpha_val = alpha_tensor.mean().item()
         if eta_val <= 1e-4:
             if self.replay_ratio > 0.0:
@@ -131,7 +129,7 @@ class MemoryBlock(nn.Module):
 
             # Reconstruct memory content locally (L2 regression).
             # Target the normalized input so memory learns the current context.
-            target = alpha_local * hidden_det + (1.0 - alpha_local) * x_l2
+            target = x_l2.detach()
             loss = F.mse_loss(mem_local, target)
             if alpha_local.numel() > 0:
                 retention_weight = (alpha_local.mean().clamp(0.0, 1.0) * 0.1).item()
