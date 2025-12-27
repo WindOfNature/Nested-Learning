@@ -1,3 +1,9 @@
+# ANNOUNCEMENT OF DISCONTUNIATION
+> Yo! WindOfNature here, so i want to announce this project will be discontinued, due to Codex and Jules being lazy(and this codebase is 100% broken), Codex and Jules cannot learn the paper properly either, i am having a mental breakdown trying to convince those shit models to implement the real one, but they always say "it's too complex" or just make broken code like this entire shit codebase, **What you(and i) can do instead**:
+* Wait for Google Official implementation/Release
+* if you can code a complex ML code, please make a framework to make people life easier
+* Convince Jules/Codex to fucking implement a real thing
+
 # Nested Learning
 
 An unofficial implementation of **Nested Learning (NL)** and **HOPE** from
