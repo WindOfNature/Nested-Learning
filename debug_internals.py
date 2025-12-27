@@ -91,7 +91,7 @@ def debug_hooks():
     print("Running Forensic Debug Loop...")
     for i in range(5):
         print(f"--- Step {i} ---")
-        logits = model(x, time=i)
+        logits = model(x, time=i, update_memory=False)
 
         # Explosion Detector
         if torch.isnan(logits).any():
@@ -104,7 +104,7 @@ def debug_hooks():
             break
 
         optimizer.zero_grad()
-        loss.backward()
+        loss.backward(retain_graph=True)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         if model._last_context is not None and model._last_context.grad is not None:
@@ -124,7 +124,7 @@ def debug_hooks():
 
         optimizer.step()
 
-        model.update_chunk(x)
+        # Skip offline maintenance to keep debug graph free of in-place updates.
 
 if __name__ == "__main__":
     debug_hooks()

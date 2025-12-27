@@ -34,8 +34,8 @@ class HOPEModel(nn.Module):
         if preset == "adaptive":
             return {
                 "memory_decay": 0.01,
-                "replay_ratio": 0.0,
-                "replay_steps": 0,
+                "replay_ratio": 0.1,
+                "replay_steps": 1,
                 "self_mod_depth": 3,
                 "nested_depth": 2,
                 "nested_hidden": 128,

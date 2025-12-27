@@ -172,7 +172,7 @@ class MemoryBlock(nn.Module):
         else:
             new_hidden = mem
 
-        return out_final, new_hidden.detach()
+        return out_final, new_hidden
 
     def state(self) -> MemoryState:
         # Placeholder as state is now external
