@@ -303,6 +303,35 @@ class SelfReferentialTitan(nn.Module):
             signals = self._compute_signals(chunk)
             self._update_modules(signals, update_memory=True, update_projections=False)
 
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        chunk_size = chunk_size or x.shape[0]
+        memory_chunk_size = memory_chunk_size or chunk_size
+        if chunk_size <= 0 or memory_chunk_size <= 0:
+            raise ValueError("chunk_size and memory_chunk_size must be positive")
+        outputs = []
+        for start in range(0, x.shape[0], chunk_size):
+            chunk = x[start : start + chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(
+                signals,
+                update_memory=False,
+                update_projections=True,
+                projection_mask=projection_mask,
+            )
+            outputs.append(chunk + signals.eta * signals.memory)
+        for start in range(0, x.shape[0], memory_chunk_size):
+            chunk = x[start : start + memory_chunk_size]
+            signals = self._compute_signals(chunk)
+            self._update_modules(signals, update_memory=True, update_projections=False)
+        return torch.cat(outputs, dim=0)
+
 
 class SelfModifyingStack(nn.Module):
     """Stacked self-referential titans for deeper self-modifying updates."""
@@ -343,6 +372,24 @@ class SelfModifyingStack(nn.Module):
                 memory_chunk_size=memory_chunk_size,
                 projection_mask=projection_mask,
             )
+
+    @torch.no_grad()
+    def update_chunk_and_forward(
+        self,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+        memory_chunk_size: int | None = None,
+        projection_mask: Sequence[bool] | None = None,
+    ) -> torch.Tensor:
+        out = x
+        for layer in self.layers:
+            out = layer.update_chunk_and_forward(
+                out,
+                chunk_size=chunk_size,
+                memory_chunk_size=memory_chunk_size,
+                projection_mask=projection_mask,
+            )
+        return out
 
 
 @dataclass

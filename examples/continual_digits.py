@@ -197,7 +197,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--max-samples", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--cms-frequencies", type=str, default=None)
     parser.add_argument("--cms-depth", type=int, default=None)
     parser.add_argument("--cms-chunk-size", type=int, default=None)
@@ -234,7 +234,10 @@ def main():
     if args.cms_frequencies:
         args.cms_frequencies = [int(item.strip()) for item in args.cms_frequencies.split(",") if item.strip()]
 
-    device = torch.device(args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     torch.manual_seed(args.seed)
     rng = torch.Generator(device=device).manual_seed(args.seed)
 

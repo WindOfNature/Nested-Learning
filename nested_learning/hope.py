@@ -495,18 +495,15 @@ class HOPEModel(nn.Module):
                 else:
                     encoded = self.conv(encoded.transpose(1, 2)).transpose(1, 2)
 
-            if self.self_mod is not None:
-                self.self_mod.update_chunk(
+            if self.backbone == "attention":
+                modulated = self.attention(encoded)
+            else:
+                modulated = self.self_mod.update_chunk_and_forward(
                     encoded,
                     chunk_size=chunk_size,
                     memory_chunk_size=memory_chunk_size,
                     projection_mask=self.self_mod_projection_mask,
                 )
-
-            if self.backbone == "attention":
-                modulated = self.attention(encoded)
-            else:
-                modulated = self.self_mod(encoded)
 
             normed = self.norm(modulated)
             if self.post_norm is not None:
