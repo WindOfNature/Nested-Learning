@@ -410,6 +410,15 @@ class HOPEModel(nn.Module):
         if self.backbone == "attention":
             modulated = self.attention(encoded)
         else:
+            if update_memory and not torch.is_grad_enabled():
+                chunk_size = self.cms_chunk_size or encoded.size(0)
+                memory_chunk = self.cms_memory_chunk_size or chunk_size
+                self.self_mod.update_chunk(
+                    encoded,
+                    chunk_size=chunk_size,
+                    memory_chunk_size=memory_chunk,
+                    projection_mask=self.self_mod_projection_mask,
+                )
             modulated = self.self_mod(encoded)
         normed = self.norm(modulated)
         if self.post_norm is not None:

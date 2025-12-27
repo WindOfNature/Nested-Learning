@@ -123,15 +123,31 @@ def train_task(
             # 3. Train with task-weighted replay
             if replay_data is not None:
                 rx, ry, rtask = replay_data
-                combined_x = torch.cat([batch_x, rx], dim=0)
-                combined_features, new_cms_states, _ = model.forward_features(
-                    combined_x,
+                replay_features, _, _ = model.forward_features(
+                    rx,
+                    time=global_step,
+                    update_memory=False,
+                    state=running_state,
+                )
+                loss_replay = 0.0
+                replay_dec_state = None
+                for task_value in torch.unique(rtask):
+                    mask = rtask == task_value
+                    if not mask.any():
+                        continue
+                    logits_replay, replay_dec_state, _ = model.forward_decoder(
+                        replay_features[mask],
+                        task_id=int(task_value.item()),
+                        update_memory=False,
+                        state=running_state,
+                    )
+                    loss_replay = loss_replay + torch.nn.functional.cross_entropy(logits_replay, ry[mask])
+                current_features, new_cms_states, _ = model.forward_features(
+                    batch_x,
                     time=global_step,
                     update_memory=True,
                     state=running_state,
                 )
-                current_features = combined_features[: batch_x.size(0)]
-                replay_features = combined_features[batch_x.size(0) :]
                 logits_current, new_dec_state, _ = model.forward_decoder(
                     current_features,
                     task_id=task_id,
@@ -139,18 +155,6 @@ def train_task(
                     state=running_state,
                 )
                 loss_current = torch.nn.functional.cross_entropy(logits_current, batch_y)
-                loss_replay = 0.0
-                for task_value in torch.unique(rtask):
-                    mask = rtask == task_value
-                    if not mask.any():
-                        continue
-                    logits_replay, _, _ = model.forward_decoder(
-                        replay_features[mask],
-                        task_id=int(task_value.item()),
-                        update_memory=True,
-                        state=running_state,
-                    )
-                    loss_replay = loss_replay + torch.nn.functional.cross_entropy(logits_replay, ry[mask])
                 loss = loss_current + replay_weight * loss_replay
             else:
                 current_features, new_cms_states, _ = model.forward_features(
@@ -166,7 +170,6 @@ def train_task(
                     state=running_state,
                 )
                 loss = torch.nn.functional.cross_entropy(logits_current, batch_y)
-                combined_x = batch_x
             running_state = HopeState(
                 time=global_step,
                 memory=detach_state(new_cms_states),
@@ -186,10 +189,26 @@ def train_task(
                 monitored = acc_monitor()
                 if monitored < acc_floor:
                     replay_weight = min(0.8, replay_weight * 2.0)
+                    for group in optimizer.param_groups:
+                        group["lr"] = max(1e-4, group["lr"] * 0.5)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            if model.self_mod is not None:
+                with torch.no_grad():
+                    encoded_update = torch.relu(model.encoder(batch_x))
+                    if model.pre_norm is not None:
+                        encoded_update = model.pre_norm(encoded_update)
+                    if model.conv is not None:
+                        encoded_update = model.conv(encoded_update.unsqueeze(-1)).squeeze(-1)
+                    model.self_mod.update_chunk(
+                        encoded_update,
+                        chunk_size=model.cms_chunk_size or batch_x.size(0),
+                        memory_chunk_size=model.cms_memory_chunk_size or batch_x.size(0),
+                        projection_mask=model.self_mod_projection_mask,
+                    )
 
             if epoch == epochs - 1 and step % (batch_size * 4) == 0:
                 model.self_update_from_logits()

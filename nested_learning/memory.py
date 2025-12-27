@@ -94,8 +94,8 @@ class MemoryBlock(nn.Module):
         if torch.is_grad_enabled() and x.requires_grad:
             return out, new_hidden
         eta_val = eta_tensor.mean().item()
-        lr_boost = min(4.0, max(1.0, self.frequency / 4.0))
-        eta_val *= lr_boost
+        lr_scale = max(0.25, min(4.0, 1.0 / max(1.0, float(self.frequency))))
+        eta_val *= lr_scale
         alpha_val = alpha_tensor.mean().item()
         if eta_val <= 1e-4:
             if self.replay_ratio > 0.0:
@@ -130,8 +130,8 @@ class MemoryBlock(nn.Module):
             mem_local = alpha_local * hidden_det + (1.0 - alpha_local) * mem_local
 
             # Reconstruct memory content locally (L2 regression).
-            # Self-referential target to align memory with its own gated prediction.
-            target = alpha_local * hidden_det + (1.0 - alpha_local) * mem_local
+            # Target the normalized input so memory learns the current context.
+            target = alpha_local * hidden_det + (1.0 - alpha_local) * x_l2
             loss = F.mse_loss(mem_local, target)
             if alpha_local.numel() > 0:
                 retention_weight = (alpha_local.mean().clamp(0.0, 1.0) * 0.1).item()
